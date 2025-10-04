@@ -1,0 +1,15 @@
+# SQLite database files
+*.vault
+*.vault-shm
+*.vault-wal
+
+# Backup files
+BACKUP.zip
+BACKUP/
+
+# Temporary upload directory
+upload_temp/
+
+# Python cache
+__pycache__/
+*.pyc
