@@ -21,7 +21,11 @@ CompactVault is a lightweight and efficient local asset manager that runs as a s
     ```
     The application will open automatically in your web browser.
 
-2.  **Set a Password (Recommended):**
+2.  **Select or Create a Vault:**
+    - If no `.vault` files are found in the directory, a new one named `default.vault` will be created for you.
+    - If one or more `.vault` files exist, you will be prompted to select one or create a new one.
+
+3.  **Set a Password (Recommended):**
     Run the server with the `COMPACTVAULT_PASSWORD` environment variable.
     ```bash
     COMPACTVAULT_PASSWORD="your-secret-password" python3 server.py

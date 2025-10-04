@@ -842,11 +842,6 @@ document.addEventListener('DOMContentLoaded', () => {
     down.textContent = "Download selected";
     down.onclick = () => downloadBulk([...state.selection.assets]);
     btns.appendChild(down);
-    const delBtn = document.createElement("button");
-    delBtn.className = "btn danger";
-    delBtn.textContent = "Delete selected";
-    delBtn.onclick = () => deleteBulk([...state.selection.assets]);
-    btns.appendChild(delBtn);
     header.appendChild(btns);
     area.appendChild(header);
   }
@@ -864,25 +859,6 @@ document.addEventListener('DOMContentLoaded', () => {
       toast("Download started", 'success');
     } catch (e) {
       toast(`Download failed: ${e.message}`, 'error');
-    }
-  }
-
-  async function deleteBulk(ids) {
-    if (confirm(`Delete ${ids.length} assets?`)) {
-      try {
-        await api(`/collections/${state.selection.collection}/assets/delete`, {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ids})
-        });
-        toast("Assets deleted", 'success');
-        state.selection.assets.clear();
-        state.offset = 0;
-        await loadAssets(state.selection.collection);
-        clearPreview();
-      } catch (e) {
-        toast(`Delete failed: ${e.message}`, 'error');
-      }
     }
   }
 
@@ -906,11 +882,6 @@ document.addEventListener('DOMContentLoaded', () => {
       down.textContent = "Download";
       down.onclick = () => downloadAsset(`/api/assets/${asset_id}`, res.filename);
       btns.appendChild(down);
-      const delBtn = document.createElement("button");
-      delBtn.className = "btn danger";
-      delBtn.textContent = "Delete";
-      delBtn.onclick = () => deleteAsset(asset_id);
-      btns.appendChild(delBtn);
       header.appendChild(btns);
       area.appendChild(header);
       const surface = document.createElement("div");
@@ -945,20 +916,6 @@ document.addEventListener('DOMContentLoaded', () => {
       area.appendChild(surface);
     } catch (e) {
       toast(`Preview error: ${e.message}`, 'error');
-    }
-  }
-
-  async function deleteAsset(asset_id) {
-    if (confirm("Delete this asset?")) {
-      try {
-        await api(`/assets/${asset_id}`, {method: 'DELETE'});
-        toast("Asset deleted", 'success');
-        state.offset = 0;
-        await loadAssets(state.selection.collection);
-        clearPreview();
-      } catch (e) {
-        toast(`Delete failed: ${e.message}`, 'error');
-      }
     }
   }
 
@@ -1020,74 +977,98 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  async function uploadFiles(items, pathPrefix = '') {
-    if (!state.selection.collection) return toast("Select a collection first", 'error');
+  async function uploadFiles(items) {
+    if (!state.selection.collection) {
+      toast("Select a collection first", 'error');
+      return;
+    }
 
-    const files = [];
-    const subDirs = [];
+    const filesToUpload = [];
 
-    for (const item of items) {
-      if (item instanceof File) {
-        files.push(item);
-      } else if (item.kind === 'file') {
-        files.push(await item.getFile());
-      } else if (item.kind === 'directory') {
-        subDirs.push(await item.getFileSystemHandle());
+    async function getFilesFromEntry(entry, path = '') {
+      if (entry.isFile) {
+        return new Promise(resolve => {
+          entry.file(f => resolve([{ file: f, path: path }]));
+        });
+      }
+      if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const entries = await new Promise(resolve => reader.readEntries(resolve));
+        let files = [];
+        for (const subEntry of entries) {
+          files.push(...await getFilesFromEntry(subEntry, path + entry.name + '/'));
+        }
+        return files;
+      }
+      return [];
+    }
+
+    const droppedItems = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.webkitGetAsEntry) {
+        droppedItems.push(item.webkitGetAsEntry());
+      } else if (item instanceof File) {
+        filesToUpload.push({ file: item, path: '' });
       }
     }
 
+    for (const entry of droppedItems) {
+      filesToUpload.push(...await getFilesFromEntry(entry));
+    }
+
+    if (filesToUpload.length === 0) return;
+
     try {
-        if (files.length > 0) {
-            let total_size = files.reduce((acc, f) => acc + f.size, 0);
-            let uploaded_size = 0;
+      let total_size = filesToUpload.reduce((acc, f) => acc + f.file.size, 0);
+      let uploaded_size = 0;
 
-            Progress.show(`Uploading ${files.length} files...`);
-            Progress.update(0);
+      Progress.show(`Uploading ${filesToUpload.length} files...`);
+      Progress.update(0);
 
-            const update_progress = (chunk_size) => {
-                uploaded_size += chunk_size;
-                Progress.update((uploaded_size / total_size) * 100);
-            };
+      const update_progress = (chunk_size) => {
+        uploaded_size += chunk_size;
+        Progress.update((uploaded_size / total_size) * 100);
+      };
 
-            const concurrency = 8;
-            let promises = new Set();
-            for (const file of files) {
-                const promise = uploadFileInChunks(file, state.selection.collection, pathPrefix, update_progress);
-                promises.add(promise);
-                promise.then(() => promises.delete(promise));
-                if (promises.size >= concurrency) {
-                    await Promise.race(promises);
-                }
-            }
-            await Promise.all(promises);
+      const concurrency = 8;
+      const promises = new Set();
+      for (const { file, path } of filesToUpload) {
+        const promise = uploadFileInChunks(file, state.selection.collection, path, update_progress);
+        promises.add(promise);
+        promise.then(() => promises.delete(promise));
+        if (promises.size >= concurrency) {
+          await Promise.race(promises);
         }
+      }
+      await Promise.all(promises);
 
-        for (const dir of subDirs) {
-          const reader = dir.createReader();
-          const entries = await new Promise(res => reader.readEntries(res));
-          await uploadFiles(entries, pathPrefix + dir.name + '/');
-        }
     } catch (e) {
-        toast(e.message, 'error');
+      toast(e.message, 'error');
     } finally {
-        if (!pathPrefix) {
-          Progress.hide();
-          toast('Uploads accepted, processing in background...', 'info');
+      Progress.hide();
+      toast('Uploads accepted, processing in background...', 'info');
 
-          // Poll for changes
-          let attempts = 0;
-          const maxAttempts = 60;
-          const interval = 2000; // 2 seconds
+      // Poll for changes
+      let attempts = 0;
+      const maxAttempts = 60;
+      const interval = 2000; // 2 seconds
 
-          const poll = setInterval(async () => {
-            attempts++;
-            const newAssets = await loadAssets(state.selection.collection);
-
-            if (newAssets.assets.length > state.assets.length || attempts > maxAttempts) {
-              clearInterval(poll);
+      const poll = setInterval(async () => {
+        attempts++;
+        try {
+            if (!state.selection.collection) {
+                clearInterval(poll);
+                return;
             }
-          }, interval);
+            const newAssets = await loadAssets(state.selection.collection);
+            if (newAssets.assets.length > state.assets.length || attempts > maxAttempts) {
+                clearInterval(poll);
+            }
+        } catch (e) {
+            clearInterval(poll);
         }
+      }, interval);
     }
   }
 
@@ -1770,10 +1751,6 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             (r'^/api/maintenance/vacuum$', 'api_vacuum'),
             (r'^/api/select_db$', 'api_select_db'),
             (r'^/api/collections/(\d+)/assets/download$', 'handle_bulk_download'),
-            (r'^/api/collections/(\d+)/assets/delete$', 'handle_bulk_delete'),
-        ],
-        'DELETE': [
-            (r'^/api/assets/(\d+)$', 'handle_asset_delete'),
         ],
     }
 
@@ -1843,7 +1820,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         headers['Content-Length'] = str(len(data))
         # Add CORS headers to allow API calls
         headers['Access-Control-Allow-Origin'] = '*'
-        headers['Access-Control-Allow-Methods'] = 'GET,POST,DELETE,OPTIONS'
+        headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
         headers['Access-Control-Allow-Headers'] = 'Content-Type,Range,Authorization'
         self.send_response(code)
         for k,v in headers.items(): self.send_header(k,v)
@@ -1853,9 +1830,15 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header('Access-control-allow-methods','GET,POST,DELETE,OPTIONS')
+        self.send_header('Access-control-allow-methods','GET,POST,OPTIONS')
         self.send_header('Access-Control-Allow-Headers','Content-Type,Range,Authorization')
         self.end_headers()
+
+    def require_manager(self):
+        if not self.server.app_state.get("manager"):
+            self._send_json({"message": "No database selected"}, 400)
+            return False
+        return True
 
     def route_request(self, method):
         for pattern, handler_name in self.routes.get(method, []):
@@ -1881,9 +1864,6 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.route_request('POST')
 
-    def do_DELETE(self):
-        self.route_request('DELETE')
-
     def show_db_selector(self):
         files = [f for f in os.listdir('.') if f.endswith('.vault')]
         file_links = ' '.join(f'<a href="#" onclick="selectDb(\'{f}\')">{f}</a>' for f in files)
@@ -1891,9 +1871,11 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         self._send_raw(html.encode('utf-8'), headers={'Content-Type': 'text/html'})
 
     def api_get_all_projects(self):
+        if not self.require_manager(): return
         self._send_json(self.server.app_state["manager"].get_all_projects())
 
     def api_get_project(self, project_id_str):
+        if not self.require_manager(): return
         try:
             project_id = int(project_id_str)
             project = self.server.app_state["manager"].get_project(project_id)
@@ -1905,6 +1887,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({'message': 'Invalid project ID'}, 400)
 
     def api_create_project(self):
+        if not self.require_manager(): return
         try:
             length = int(self.headers.get('content-length'))
             body = json.loads(self.rfile.read(length))
@@ -1920,6 +1903,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({'message': f'Create failed: {e}'}, 500)
 
     def api_get_project_collections(self, project_id_str):
+        if not self.require_manager(): return
         try:
             project_id = int(project_id_str)
             self._send_json(self.server.app_state["manager"].get_collections_for_project(project_id))
@@ -1927,6 +1911,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({'message': 'Invalid project ID'}, 400)
 
     def api_get_collection(self, collection_id_str):
+        if not self.require_manager(): return
         try:
             collection_id = int(collection_id_str)
             collection = self.server.app_state["manager"].get_collection(collection_id)
@@ -1938,6 +1923,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({'message': 'Invalid collection ID'}, 400)
 
     def api_create_collection(self):
+        if not self.require_manager(): return
         try:
             length = int(self.headers.get('content-length'))
             body = json.loads(self.rfile.read(length))
@@ -1954,6 +1940,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({'message': f'Create failed: {e}'}, 500)
 
     def api_get_collection_assets(self, collection_id_str):
+        if not self.require_manager(): return
         try:
             collection_id = int(collection_id_str)
             qs = parse_qs(urlparse(self.path).query)
@@ -1966,6 +1953,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({'message': 'Invalid collection ID'}, 400)
 
     def handle_asset_preview(self, asset_id_str):
+        if not self.require_manager(): return
         try:
             asset_id = int(asset_id_str)
             preview_data = self.server.app_state["manager"].get_asset_preview(asset_id)
@@ -1977,6 +1965,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({'message': 'Invalid asset ID'}, 400)
 
     def handle_asset_download(self, asset_id_str):
+        if not self.require_manager(): return
         try:
             asset_id = int(asset_id_str)
 
@@ -2029,20 +2018,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             logging.error(f"Download error: {e}")
             self.send_error(500)
 
-    def handle_asset_delete(self, asset_id_str):
-        try:
-            asset_id = int(asset_id_str)
-            manager = self.server.app_state["manager"]
-            with manager.lock:
-                manager.conn.execute("DELETE FROM metadata WHERE asset_id = ?", (asset_id,))
-                manager.conn.execute("DELETE FROM assets WHERE id = ?", (asset_id,))
-                manager.conn.commit()
-            self.send_response(204)
-            self.end_headers()
-        except Exception as e:
-            self._send_json({'message': str(e)}, 500)
-
     def handle_bulk_download(self, collection_id_str):
+        if not self.require_manager(): return
         try:
             length = int(self.headers.get('content-length'))
             body = json.loads(self.rfile.read(length))
@@ -2064,26 +2041,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             logging.error(f"Bulk download error: {e}")
             self.send_error(500)
 
-    def handle_bulk_delete(self, collection_id_str):
-        try:
-            length = int(self.headers.get('content-length'))
-            body = json.loads(self.rfile.read(length))
-            ids = body.get('ids', [])
-            if not ids:
-                self.send_error(400)
-                return
-            manager = self.server.app_state["manager"]
-            with manager.lock:
-                for aid in ids:
-                    manager.conn.execute("DELETE FROM metadata WHERE asset_id = ?", (aid,))
-                    manager.conn.execute("DELETE FROM assets WHERE id = ?", (aid,))
-                manager.conn.commit()
-            self.send_response(204)
-            self.end_headers()
-        except Exception as e:
-            self._send_json({'message': str(e)}, 500)
-
     def api_vacuum(self):
+        if not self.require_manager(): return
         self.server.app_state["manager"].vacuum()
         self._send_json({'message': 'VACUUM complete'})
 
@@ -2132,6 +2091,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({'message': f'Chunk upload failed: {e}'}, 500)
 
     def api_complete_upload(self):
+        if not self.require_manager(): return
         try:
             length = int(self.headers.get('content-length'))
             body = json.loads(self.rfile.read(length))
@@ -2164,6 +2124,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({'message': f'Upload completion failed: {e}'}, 500)
 
     def api_download_project(self, project_id_str):
+        if not self.require_manager(): return
         try:
             project_id = int(project_id_str)
             proj = self.server.app_state["manager"].get_project(project_id)
@@ -2189,6 +2150,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(500)
 
     def api_download_collection(self, collection_id_str):
+        if not self.require_manager(): return
         try:
             collection_id = int(collection_id_str)
             coll = self.server.app_state["manager"].get_collection(collection_id)

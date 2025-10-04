@@ -49,6 +49,14 @@ The `assets` table does not store the file itself, but rather a JSON `manifest` 
 
 The frontend is a single-page application (SPA) written entirely in **vanilla JavaScript (ES6+)**, with no frameworks or external libraries. The HTML, CSS, and JavaScript are all embedded as strings within the main `server.py` file and served as a single HTML document.
 
+### Startup & Vault Selection
+
+Upon starting, the server checks for the existence of `.vault` files:
+-   **No Vaults Found:** If no vault files exist, the server automatically creates a `default.vault` and initializes a `CompactVaultManager` to use it. The main application UI is served immediately.
+-   **Vaults Found:** If one or more `.vault` files are present, the `CompactVaultManager` is **not** immediately initialized. Instead, the server serves a special HTML page that acts as a vault selector. This page allows the user to either choose an existing vault or create a new one.
+
+Only after a vault is selected (via the `/api/select_db` endpoint) is the `CompactVaultManager` instance created and associated with the server process. All subsequent API requests are then handled by this manager instance.
+
 ### Key Components:
 
 -   **State Management:** A global `state` object holds the application's entire state.
