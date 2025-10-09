@@ -32,7 +32,7 @@ The `CompactVaultManager` provides methods for adding and reading data, but **in
 To guarantee integrity and save space, all assets are chunked and hashed:
 
 1.  When a file is uploaded, it is broken into chunks.
-2.  A `SHA-256` hash of each chunk's data is calculated.
+2.  A `blake2b` hash of each chunk's data is calculated.
 3.  The chunk is compressed and stored in the `chunks` table, indexed by its hash.
 
 This system provides two key benefits for a permanent archive:
