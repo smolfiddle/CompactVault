@@ -2,6 +2,8 @@
 
 **Your personal, permanent, write-once asset archive.**
 
+![CompactVault Screenshot](https://i.imgur.com/tOeRCV6.png)
+
 CompactVault is a local-first asset manager designed for long-term, reliable storage. It operates on a **WORM (Write Once, Read Many)** principle, ensuring that once an asset is added to the vault, it remains unchanged. This makes it the perfect solution for developers, artists, and archivists who need to build a permanent and secure library of their digital assets.
 
 ---
