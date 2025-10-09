@@ -1291,7 +1291,7 @@ class CompactVaultManager:
                         data = zlib.decompress(asset['data']) if asset.get('compression') == 'zlib' else asset['data']
                         for i in range(0, len(data), CHUNK_SIZE):
                             chunk_data = data[i:i + CHUNK_SIZE]
-                            h = hashlib.sha256(chunk_data).hexdigest()
+                            h = hashlib.blake2b(chunk_data).hexdigest()
                             compressed = zlib.compress(chunk_data, level=9)
                             manifest['chunks'].append(h)
                             c.execute("INSERT OR IGNORE INTO chunks (hash, data) VALUES (?, ?)", (h, compressed))
@@ -1338,7 +1338,7 @@ class CompactVaultManager:
                         chunk_data = f.read()
 
                     chunk_size = len(chunk_data)
-                    chunk_hash = hashlib.sha256(chunk_data).hexdigest()
+                    chunk_hash = hashlib.blake2b(chunk_data).hexdigest()
                     compressed = zlib.compress(chunk_data, level=9)
 
                     with self.lock:
@@ -1351,7 +1351,7 @@ class CompactVaultManager:
                         'previous_hash': previous_block_hash
                     }
                     block_str = json.dumps(block, sort_keys=True)
-                    block_hash = hashlib.sha256(block_str.encode()).hexdigest()
+                    block_hash = hashlib.blake2b(block_str.encode()).hexdigest()
 
                     manifest['chain'].append(block)
                     manifest['total_size'] += chunk_size
