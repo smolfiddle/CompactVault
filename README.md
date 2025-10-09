@@ -1,19 +1,29 @@
 # CompactVault
 
-CompactVault is a lightweight and efficient local asset manager that runs as a self-contained web server. It is designed for developers, designers, and hobbyists who need a simple tool to organize, view, and manage digital assets like images, videos, and documents.
+**Your personal, permanent, write-once asset archive.**
 
-![CompactVault Screenshot](https://i.imgur.com/example.png) <!-- Replace with a real screenshot URL later -->
+CompactVault is a local-first asset manager designed for long-term, reliable storage. It operates on a **WORM (Write Once, Read Many)** principle, ensuring that once an asset is added to the vault, it remains unchanged. This makes it the perfect solution for developers, artists, and archivists who need to build a permanent and secure library of their digital assets.
 
-## Features
+---
 
-- **Zero Dependencies:** Runs anywhere Python is installed.
-- **Web Interface:** Modern, responsive UI with drag-and-drop uploading and readable, wrapping filenames.
-- **Intelligent Sorting:** Assets are automatically sorted using a natural sort order (e.g., "Episode 2" comes after "Episode 1").
-- **Expanded Previews:** Preview common text files (including code), images, audio, and video directly in the browser.
-- **Chunk-Based Storage:** Saves space with file deduplication and allows for efficient streaming.
-- **Video Streaming:** Optimized for streaming video content with HTTP Range Requests.
-- **Multi-Vault Support:** Manage multiple, separate asset databases.
-- **Secure:** Protect your vault with a password.
+## Design Philosophy: The WORM Model
+
+CompactVault is intentionally designed as a permanent archive, not a file editor.
+
+-   **Write Once:** When you add an asset, it is committed to the vault. The system is not designed for in-place editing or deletion of assets through the UI.
+-   **Read Many:** Once stored, assets can be searched, viewed, and exported countless times, with the confidence that they have not been altered.
+
+This approach guarantees the integrity of your collection, preventing accidental modification or data loss. Think of it like archiving a photo negative or burning a master to a CD-R—the goal is preservation, not modification.
+
+## Key Features
+
+-   **Permanent WORM Storage:** Store assets with confidence, knowing they won't be accidentally altered.
+-   **Hierarchical Organization:** Structure your archive with Projects and nested Collections.
+-   **Broad Asset Support:** Handles images, video, audio, code, documents, and more.
+-   **Instant Previews:** Quickly view assets directly in the browser without downloading them.
+-   **Efficient Search:** Find any asset quickly with full-text search.
+-   **Local-First Security:** Your data is stored on your local machine and never leaves your control. A password can be set for an extra layer of security.
+-   **Bulk Export:** Easily download entire collections or projects as a `.zip` file at any time.
 
 ## Getting Started
 
@@ -21,14 +31,14 @@ CompactVault is a lightweight and efficient local asset manager that runs as a s
     ```bash
     python3 server.py
     ```
-    The application will open automatically in your web browser.
+    The application will attempt to open automatically in your web browser at `http://localhost:8000`.
 
 2.  **Select or Create a Vault:**
-    - If no `.vault` files are found in the directory, a new one named `default.vault` will be created for you.
-    - If one or more `.vault` files exist, you will be prompted to select one or create a new one.
+    - If no `.vault` files are found, a new one named `default.vault` will be created.
+    - If existing `.vault` files are present, you will be prompted to choose one.
 
 3.  **Set a Password (Recommended):**
-    Run the server with the `COMPACTVAULT_PASSWORD` environment variable.
+    For security, run the server with the `COMPACTVAULT_PASSWORD` environment variable.
     ```bash
     COMPACTVAULT_PASSWORD="your-secret-password" python3 server.py
     ```
@@ -36,7 +46,8 @@ CompactVault is a lightweight and efficient local asset manager that runs as a s
 
 ## How to Use
 
-- **Projects & Collections:** Organize your files into a nested structure of projects and collections.
-- **Upload Assets:** Drag and drop files and folders directly into the "Assets" panel or use the "Upload" button.
-- **Preview:** Select an asset to see a preview. Text, images, audio, and video are supported.
-- **Download:** Download individual assets, or entire collections and projects as `.zip` files.
+-   **Create a Project:** Start by creating a top-level project for your archive.
+-   **Build Collections:** Organize your project with nested collections.
+-   **Add Assets:** Drag and drop files and folders into the "Assets" panel to permanently add them to the vault.
+-   **Browse and Preview:** Select any asset to view its content.
+-   **Export:** Use the "Download" buttons to export a copy of any asset, collection, or project.

@@ -1,75 +1,68 @@
 # CompactVault: Technical Architecture
 
-## 1. Core Philosophy
+## 1. Core Philosophy: The WORM Archive
 
-CompactVault is built on the principle of **simplicity and portability**. It operates as a single-file Python web server with a vanilla JavaScript frontend, requiring no external dependencies beyond a standard Python installation. This ensures it is lightweight, easy to run, and easy to understand.
+CompactVault is architected as a **local-first, permanent asset archive**. Its design is fundamentally based on the **WORM (Write Once, Read Many)** principle. Every technical decision is made to support the goal of creating a secure, immutable, and reliable long-term storage system for digital assets.
+
+-   **Portability & Simplicity:** It runs as a single-file Python server with an embedded vanilla JavaScript frontend, requiring no external dependencies. This ensures maximum portability and ease of use.
+-   **Data Integrity:** The primary goal is to ensure that once an asset is stored, it cannot be accidentally altered or corrupted.
+-   **Local-First:** All data is stored and managed on the user's local machine, guaranteeing privacy and control.
 
 ## 2. Backend Architecture (server.py)
 
 The backend is a multi-threaded HTTP server built using Python's standard `http.server` and `socketserver` libraries.
 
-### Key Components:
+-   **`ThreadedHTTPServer`**: Handles each incoming request in a separate thread to manage concurrent connections.
+-   **`RequestHandler`**: The core of the web server, responsible for:
+    -   **Routing**: A regex-based router maps API endpoints (e.g., `/api/projects`) to handler methods.
+    -   **Authentication**: Implements Basic Authentication via the `COMPACTVAULT_PASSWORD` environment variable.
+    -   **Rate Limiting**: A per-IP rate limiter prevents abuse while allowing legitimate bursts of requests during uploads.
+-   **`CompactVaultManager`**: The data and logic layer that abstracts all database operations. It is the sole component responsible for enforcing the WORM model.
 
--   **`ThreadedHTTPServer`**: A simple extension of `http.server.HTTPServer` that uses `ThreadingMixIn` to handle each incoming request in a separate thread, allowing the server to manage multiple concurrent connections.
+## 3. Storage Layer: The Immutable Vault
 
--   **`RequestHandler`**: This is the core of the web server. It inherits from `BaseHTTPRequestHandler` and is responsible for:
-    -   **Routing**: A simple regex-based router maps API endpoints (e.g., `/api/projects`, `/api/assets/{id}`) to their corresponding handler methods within the class.
-    -   **Authentication & Security**: Implements Basic Authentication to protect the vault. The password is read from the `COMPACTVAULT_PASSWORD` environment variable. A per-IP rate limiter is also used to prevent abuse, while allowing legitimate bursts of requests during operations like file uploads.
-    -   **Request Handling**: Contains methods for handling GET, POST, and DELETE requests for all API endpoints.
-    -   **Response Compression**: Compresses responses with Gzip where appropriate to reduce bandwidth.
+CompactVault uses a single SQLite file (`.vault`) as its database. The storage architecture is the heart of the WORM implementation.
 
--   **`CompactVaultManager`**: This class acts as the data and logic layer, abstracting all database operations away from the `RequestHandler`. It manages the SQLite connection, schema creation, and all business logic for creating, retrieving, and managing projects, collections, and assets. Its responsibilities include:
-    -   **Asset Previews:** The manager can generate previews for various asset types. For text-based files (including source code), it reads the content for in-browser display. For other types like images and video, it provides metadata for the frontend to render the appropriate preview element.
-    -   **Natural Sorting of Assets:** To ensure an intuitive user experience, asset sorting is handled entirely by the backend. When a collection is requested, the manager first retrieves the complete list of asset filenames for that collection. It then sorts this list in memory using a natural sort algorithm (correctly handling numbers embedded in text) before paginating and returning the requested page of results. This guarantees a consistent and correct sort order across the entire dataset, which would be impossible to achieve with client-side sorting on paginated data.
+### WORM (Write Once, Read Many) Model
 
-## 3. Database Design (SQLite)
+The `CompactVaultManager` provides methods for adding and reading data, but **intentionally lacks methods for editing or deleting assets**. The API exposed by the `RequestHandler` reflects this; there are no `PUT`, `PATCH`, or `DELETE` endpoints for assets. This architectural constraint is the primary mechanism for ensuring the permanence of the archive.
 
-CompactVault uses a single SQLite file (`.vault`) as its database. It operates in **Write-Ahead Logging (WAL) mode** (`PRAGMA journal_mode = WAL;`), which provides higher concurrency by allowing readers to operate while data is being written.
+### Chunk-Based Storage & Data Integrity
 
-### Schema:
-
--   `projects`: Stores project metadata.
--   `collections`: Stores collection metadata, with a `parent_id` to enable a nested, folder-like hierarchy.
--   `assets`: Contains metadata for each asset, including its type, format, and a JSON `manifest`.
--   `chunks`: This is the heart of the storage system. It stores unique, compressed data chunks.
--   `metadata`: A key-value table for storing additional asset information, such as the original filename.
-
-### Chunk-Based Storage & Deduplication:
-
-To save space and improve I/O, all assets are split into fixed-size chunks. 
+To guarantee integrity and save space, all assets are chunked and hashed:
 
 1.  When a file is uploaded, it is broken into chunks.
-2.  Each chunk is compressed using `zlib`.
-3.  A `SHA-256` hash of the uncompressed chunk data is calculated.
-4.  The compressed data is stored in the `chunks` table, indexed by its hash.
+2.  A `SHA-256` hash of each chunk's data is calculated.
+3.  The chunk is compressed and stored in the `chunks` table, indexed by its hash.
 
-If a new file contains a chunk with a hash that already exists in the database, that chunk is not stored again. This provides **data deduplication** at the chunk level.
+This system provides two key benefits for a permanent archive:
+-   **Data Deduplication:** If multiple files contain the same chunk, it is only stored once.
+-   **Verifiability:** The asset's `manifest` (a list of chunk hashes) acts as a checksum for the entire file. This allows for future integrity checks to verify that the asset data has not degraded or been tampered with at the storage level.
 
-The `assets` table does not store the file itself, but rather a JSON `manifest` that contains an ordered list of the hashes of the chunks that constitute the file.
+### Database & WAL Mode
+
+The database runs in **Write-Ahead Logging (WAL) mode** (`PRAGMA journal_mode = WAL;`), which provides high-performance reads and writes. A graceful shutdown mechanism (`signal_handler` for Ctrl+C) is implemented to run a database checkpoint, which commits all changes from the `.wal` log file into the main database and ensures the temporary files are cleanly removed.
 
 ## 4. Frontend Architecture
 
-The frontend is a single-page application (SPA) written entirely in **vanilla JavaScript (ES6+)**, with no frameworks or external libraries. The HTML, CSS, and JavaScript are all embedded as strings within the main `server.py` file and served as a single HTML document.
+The frontend is a dependency-free, single-page application (SPA) written in vanilla JavaScript (ES6+). The HTML, CSS, and JavaScript are embedded as strings within `server.py`.
 
-### Startup & Vault Selection
+-   **Virtual Rendering:** The asset list uses virtual scrolling, rendering only the visible items in the DOM. This ensures the UI remains fast and responsive even with thousands of assets.
+-   **Backend-Driven Logic:** The frontend is designed to be a "dumb" client. It is primarily responsible for rendering the data provided by the backend. Crucial logic, such as sorting, is handled entirely by the backend to ensure consistency.
 
-Upon starting, the server checks for the existence of `.vault` files:
--   **No Vaults Found:** If no vault files exist, the server automatically creates a `default.vault` and initializes a `CompactVaultManager` to use it. The main application UI is served immediately.
--   **Vaults Found:** If one or more `.vault` files are present, the `CompactVaultManager` is **not** immediately initialized. Instead, the server serves a special HTML page that acts as a vault selector. This page allows the user to either choose an existing vault or create a new one.
+## 5. Key Data Flows
 
-Only after a vault is selected (via the `/api/select_db` endpoint) is the `CompactVaultManager` instance created and associated with the server process. All subsequent API requests are then handled by this manager instance.
+### Asset Ingestion (Write Once)
 
-### Key Components:
+1.  A file is dropped onto the UI.
+2.  The frontend JavaScript reads the file and sends it in small chunks to the `/api/upload/chunk` endpoint.
+3.  Once all chunks are sent, the frontend calls `/api/upload/complete`.
+4.  The backend places a task in a queue to process the asset in a background thread.
+5.  The `CompactVaultManager` worker processes the chunks, creates a `manifest` (the ordered list of hashes), and inserts the final, immutable asset record into the database.
 
--   **State Management:** A global `state` object holds the application's entire state.
--   **API Client:** A simple `api` helper function standardizes `fetch` requests to the backend.
--   **Virtual Rendering:** The asset list uses a virtual scrolling mechanism. Only the visible items in the list are rendered in the DOM, allowing the UI to remain fast and responsive even with thousands of assets.
--   **UI Logic:** The UI is dynamically rendered and updated by manipulating the DOM directly. It is designed to be largely stateless regarding data, simply rendering the sorted and paginated data provided by the backend. List items are styled to wrap long filenames, ensuring full visibility. The code is organized by feature (e.g., `loadProjects`, `renderVisibleAssets`).
+### Asset Retrieval (Read Many)
 
-## 5. Key Feature Implementations
-
--   **Chunked Uploads:** Large files are uploaded in chunks via separate POST requests. The server reassembles these chunks and processes them in a background thread, preventing the UI from freezing.
-
--   **Optimized Video Streaming:** The backend supports HTTP Range Requests. When a video is played, the browser can request specific byte ranges of the file. The server reads the asset's manifest, identifies which chunks contain the requested bytes, and streams only those chunks back to the client. This enables instant seeking without downloading the entire file.
-
--   **Graceful Shutdown:** The server listens for `SIGINT` (Ctrl+C) and `SIGTERM` signals. The `signal_handler` ensures that the database connection is properly checkpointed and closed before the process exits, which is crucial for cleaning up the SQLite WAL files.
+1.  The user navigates to a collection.
+2.  The frontend requests assets from `/api/collections/{id}/assets`.
+3.  The backend fetches all asset records for that collection, sorts them using a **natural sort algorithm** in memory, and returns only the paginated slice requested by the client.
+4.  For previews or downloads, the backend reads the asset's manifest and streams the constituent data chunks from the database in the correct order.
