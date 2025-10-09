@@ -14,11 +14,13 @@ The backend is a multi-threaded HTTP server built using Python's standard `http.
 
 -   **`RequestHandler`**: This is the core of the web server. It inherits from `BaseHTTPRequestHandler` and is responsible for:
     -   **Routing**: A simple regex-based router maps API endpoints (e.g., `/api/projects`, `/api/assets/{id}`) to their corresponding handler methods within the class.
-    -   **Authentication**: Implements Basic Authentication to protect the vault. The password is read from the `COMPACTVAULT_PASSWORD` environment variable.
+    -   **Authentication & Security**: Implements Basic Authentication to protect the vault. The password is read from the `COMPACTVAULT_PASSWORD` environment variable. A per-IP rate limiter is also used to prevent abuse, while allowing legitimate bursts of requests during operations like file uploads.
     -   **Request Handling**: Contains methods for handling GET, POST, and DELETE requests for all API endpoints.
     -   **Response Compression**: Compresses responses with Gzip where appropriate to reduce bandwidth.
 
--   **`CompactVaultManager`**: This class acts as the data and logic layer, abstracting all database operations away from the `RequestHandler`. It manages the SQLite connection, schema creation, and all business logic for creating, retrieving, and managing projects, collections, and assets.
+-   **`CompactVaultManager`**: This class acts as the data and logic layer, abstracting all database operations away from the `RequestHandler`. It manages the SQLite connection, schema creation, and all business logic for creating, retrieving, and managing projects, collections, and assets. Its responsibilities include:
+    -   **Asset Previews:** The manager can generate previews for various asset types. For text-based files (including source code), it reads the content for in-browser display. For other types like images and video, it provides metadata for the frontend to render the appropriate preview element.
+    -   **Natural Sorting of Assets:** To ensure an intuitive user experience, asset sorting is handled entirely by the backend. When a collection is requested, the manager first retrieves the complete list of asset filenames for that collection. It then sorts this list in memory using a natural sort algorithm (correctly handling numbers embedded in text) before paginating and returning the requested page of results. This guarantees a consistent and correct sort order across the entire dataset, which would be impossible to achieve with client-side sorting on paginated data.
 
 ## 3. Database Design (SQLite)
 
@@ -62,7 +64,7 @@ Only after a vault is selected (via the `/api/select_db` endpoint) is the `Compa
 -   **State Management:** A global `state` object holds the application's entire state.
 -   **API Client:** A simple `api` helper function standardizes `fetch` requests to the backend.
 -   **Virtual Rendering:** The asset list uses a virtual scrolling mechanism. Only the visible items in the list are rendered in the DOM, allowing the UI to remain fast and responsive even with thousands of assets.
--   **UI Logic:** The UI is dynamically rendered and updated by manipulating the DOM directly. The code is organized by feature (e.g., `loadProjects`, `renderVisibleAssets`).
+-   **UI Logic:** The UI is dynamically rendered and updated by manipulating the DOM directly. It is designed to be largely stateless regarding data, simply rendering the sorted and paginated data provided by the backend. List items are styled to wrap long filenames, ensuring full visibility. The code is organized by feature (e.g., `loadProjects`, `renderVisibleAssets`).
 
 ## 5. Key Feature Implementations
 

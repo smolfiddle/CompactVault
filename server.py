@@ -249,14 +249,12 @@ input.small, select.small {
   height: 100%;
 }
 .item {
-  height: 50px;
+  min-height: 50px;
+  height: auto;
   padding: 8px 10px;
   border-radius: var(--radius);
   cursor: pointer;
   transition: background 0.2s;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -442,10 +440,8 @@ body.light {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   flex-grow: 1;
+  word-break: break-word;
 }
 .item-name {
   font-weight: 500;
@@ -1199,6 +1195,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # region CompactVaultManager
 
+def natural_sort_key(s):
+    """
+    A key for natural sorting. Splits the string into text and number parts.
+    e.g. 'file10.txt' -> ['file', 10, '.txt']
+    """
+    if not isinstance(s, str):
+        return [s]
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'([0-9]+)', s)]
+
+
 class CompactVaultManager:
     def __init__(self, db_path=DEFAULT_DB):
         self.db_path = pathlib.Path(db_path)
@@ -1233,6 +1239,7 @@ class CompactVaultManager:
             'CREATE INDEX IF NOT EXISTS idx_metadata_asset ON metadata(asset_id);',
             'CREATE INDEX IF NOT EXISTS idx_metadata_key ON metadata(key);',
             'CREATE INDEX IF NOT EXISTS idx_metadata_asset_key ON metadata(asset_id, key);',
+            'CREATE INDEX IF NOT EXISTS idx_metadata_value ON metadata(value);',
             'CREATE INDEX IF NOT EXISTS idx_collections_project ON collections(project_id);',
             'CREATE INDEX IF NOT EXISTS idx_collections_parent ON collections(parent_id);',
             'CREATE INDEX IF NOT EXISTS idx_assets_collection ON assets(collection_id);',
@@ -1313,7 +1320,7 @@ class CompactVaultManager:
         try:
             file_extension = filename.split('.')[-1].lower() if '.' in filename else 'binary'
             asset_type_map = {
-                'txt':'text','html':'text','css':'text','js':'text','md':'text','json':'text','csv':'text','xml':'text',
+                'txt':'text','html':'text','css':'text','js':'text','md':'text','json':'text','csv':'text','xml':'text','py':'text',
                 'png':'image','jpg':'image','jpeg':'image','gif':'image','svg':'image','webp':'image',
                 'mp3':'audio','wav':'audio','ogg':'audio','m4a':'audio','flac':'audio',
                 'mp4':'video','mov':'video','webm':'video', 'mkv':'video', 'avi':'video', 'flv':'video',
@@ -1417,40 +1424,71 @@ class CompactVaultManager:
     def get_assets_for_collection(self, collection_id, offset=0, limit=50, tag=None, query=None):
         with self.lock:
             try:
-                sql = 'SELECT a.id, a.type, a.format, a.manifest, m.value as filename FROM assets a LEFT JOIN metadata m ON a.id = m.asset_id AND m.key = "filename" WHERE a.collection_id = ?'
+                # 1. Fetch all IDs, manifests, and joined filenames with filtering
+                base_sql = 'SELECT a.id, a.manifest, m.value as filename FROM assets a LEFT JOIN metadata m ON a.id = m.asset_id AND m.key = "filename" WHERE a.collection_id = ?'
                 params = [collection_id]
                 if tag:
-                    sql += ' AND a.id IN (SELECT asset_id FROM metadata WHERE key = "tags" AND value LIKE ?)'
+                    base_sql += ' AND a.id IN (SELECT asset_id FROM metadata WHERE key = "tags" AND value LIKE ?)'
                     params.append(f'%{re.escape(tag)}%')
-                if query:
-                    sql += ' AND m.value LIKE ?'
-                    params.append(f'%{query}%')
-                sql += ' ORDER BY a.order_index ASC, filename LIMIT ? OFFSET ?'
-                params += [limit, offset]
-                cur = self.conn.execute(sql, params)
-                results = []
-                for r in cur.fetchall():
-                    row = dict(r)
-                    manifest = json.loads(row['manifest']) if row['manifest'] else {}
 
+                all_assets_cursor = self.conn.execute(base_sql, params)
+                
+                # Create the list, including the fallback logic for filenames
+                all_assets = []
+                for r in all_assets_cursor.fetchall():
+                    filename = r['filename']
+                    if not filename:
+                        try:
+                            manifest = json.loads(r['manifest']) if r['manifest'] else {}
+                            filename = manifest.get('filename', 'Untitled')
+                        except (json.JSONDecodeError, AttributeError):
+                            filename = 'Untitled'
+                    all_assets.append({'id': r['id'], 'filename': filename})
+
+                # Apply search query in Python
+                if query:
+                    all_assets = [a for a in all_assets if query.lower() in a['filename'].lower()]
+
+                # 2. Sort naturally in Python
+                all_assets.sort(key=lambda x: natural_sort_key(x['filename']))
+
+                # 3. Get total count
+                total = len(all_assets)
+
+                # 4. Get the slice of IDs for the current page
+                paginated_ids = [a['id'] for a in all_assets[offset:offset + limit]]
+
+                # 5. If no IDs for this page, return empty
+                if not paginated_ids:
+                    return {'assets': [], 'total': total}
+
+                # 6. Fetch full data for these paginated IDs
+                id_placeholders = ','.join('?' for _ in paginated_ids)
+                sql = f'SELECT a.id, a.type, a.format, a.manifest, m.value as filename FROM assets a LEFT JOIN metadata m ON a.id = m.asset_id AND m.key = "filename" WHERE a.id IN ({id_placeholders})'
+                
+                cur = self.conn.execute(sql, paginated_ids)
+                
+                # 7. Create a mapping from id -> details
+                asset_details_map = {r['id']: dict(r) for r in cur.fetchall()}
+
+                # 8. Create the final results list in the correct order
+                results = []
+                for asset_id in paginated_ids:
+                    row = asset_details_map.get(asset_id)
+                    if not row: continue
+
+                    manifest = json.loads(row['manifest']) if row['manifest'] else {}
+                    # Re-apply filename logic for the final output
                     if not row['filename']:
                         row['filename'] = manifest.get('filename', 'Untitled')
-
                     row['size_original'] = manifest.get('total_size', 0)
                     del row['manifest']
                     results.append(row)
 
-                total_sql = 'SELECT COUNT(*) FROM assets a LEFT JOIN metadata m ON a.id = m.asset_id AND m.key = "filename" WHERE a.collection_id = ?'
-                total_params = [collection_id]
-                if tag:
-                    total_sql += ' AND a.id IN (SELECT asset_id FROM metadata WHERE key = "tags" AND value LIKE ?)'
-                    total_params.append(f'%{re.escape(tag)}%')
-                if query:
-                    total_sql += ' AND m.value LIKE ?'
-                    total_params.append(f'%{query}%')
-                total = self.conn.execute(total_sql, total_params).fetchone()[0]
+                # 9. Return final data
                 return {'assets': results, 'total': total}
-            except sqlite3.Error as e:
+
+            except (sqlite3.Error, json.JSONDecodeError) as e:
                 logging.error(f"Get assets error: {e}")
                 return {'assets': [], 'total': 0}
 
@@ -1730,7 +1768,7 @@ class RateLimiter:
         return True
 
 class RequestHandler(http.server.BaseHTTPRequestHandler):
-    rate_limiter = RateLimiter()
+    rate_limiter = RateLimiter(requests_per_minute=300)
     routes = {
         'GET': [
             (r'^/api/projects$', 'api_get_all_projects'),
@@ -1782,7 +1820,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             ip = self.client_address[0]
-            if not self.path.startswith('/api/upload/chunk'):
+            if not (self.path.startswith('/api/upload/chunk') or self.path.startswith('/api/upload/complete')):
                 if not self.rate_limiter.is_allowed(ip):
                     self.requestline = ""
                     self.send_error(429, "Too Many Requests")

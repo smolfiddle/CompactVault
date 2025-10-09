@@ -7,8 +7,10 @@ CompactVault is a lightweight and efficient local asset manager that runs as a s
 ## Features
 
 - **Zero Dependencies:** Runs anywhere Python is installed.
+- **Web Interface:** Modern, responsive UI with drag-and-drop uploading and readable, wrapping filenames.
+- **Intelligent Sorting:** Assets are automatically sorted using a natural sort order (e.g., "Episode 2" comes after "Episode 1").
+- **Expanded Previews:** Preview common text files (including code), images, audio, and video directly in the browser.
 - **Chunk-Based Storage:** Saves space with file deduplication and allows for efficient streaming.
-- **Web Interface:** Modern, responsive UI with drag-and-drop uploading.
 - **Video Streaming:** Optimized for streaming video content with HTTP Range Requests.
 - **Multi-Vault Support:** Manage multiple, separate asset databases.
 - **Secure:** Protect your vault with a password.
