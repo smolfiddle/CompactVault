@@ -2,7 +2,7 @@
 
 CompactVault is a lightweight and efficient local asset manager that runs as a self-contained web server. It is designed for developers, designers, and hobbyists who need a simple tool to organize, view, and manage digital assets like images, videos, and documents.
 
-![CompactVault Screenshot](https://imgur.com/a/o4ZnKXK) <!-- Replace with a real screenshot URL later -->
+![CompactVault Screenshot](https://i.imgur.com/tOeRCV6.png) <!-- Replace with a real screenshot URL later -->
 
 ## Features
 
