@@ -25,6 +25,7 @@ import time
 import base64
 from collections import defaultdict
 from socketserver import ThreadingMixIn
+from typing import Any, Dict, List, Optional, Tuple, Iterator
 
 class ThreadedHTTPServer(ThreadingMixIn, http.server.HTTPServer):
     pass
@@ -46,6 +47,7 @@ HTML_TEMPLATE = '''
   <header class="topbar">
     <div class="brand">CompactVault</div>
     <div class="actions">
+      <button id="vacuum-btn" class="small">Vacuum</button>
       <button id="theme-toggle" class="small" aria-label="Toggle theme">🌓</button>
     </div>
   </header>
@@ -1090,6 +1092,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
   el("add-collection").onclick = () => createCollection();
 
+  el("vacuum-btn").onclick = async () => {
+    try {
+      toast("Vacuuming database...", "info");
+      await api("/maintenance/vacuum", { method: "POST" });
+      toast("Database vacuumed successfully!", "success");
+    } catch (e) {
+      toast(`Vacuum failed: ${e.message}`, "error");
+    }
+  };
+
+
   async function createProject() {
     const name = prompt("Project name");
     if (!name) return;
@@ -1189,7 +1202,7 @@ if os.path.exists(UPLOAD_TEMP_DIR):
 os.makedirs(UPLOAD_TEMP_DIR, exist_ok=True)
 
 DEFAULT_DB = "default.vault"
-HARDCODED_PASSWORD = os.getenv("COMPACTVAULT_PASSWORD", "password")  # Use environment variable for security
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -1206,7 +1219,7 @@ def natural_sort_key(s):
 
 
 class CompactVaultManager:
-    def __init__(self, db_path=DEFAULT_DB):
+    def __init__(self, db_path: str = DEFAULT_DB) -> None:
         self.db_path = pathlib.Path(db_path)
         self.lock = threading.RLock()
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
@@ -1222,16 +1235,17 @@ class CompactVaultManager:
         self._ensure_schema_extensions()
 
         # Asset creation queue and worker
-        self.asset_creation_queue = queue.Queue()
+        self.asset_creation_queue: queue.Queue[Optional[Tuple[int, List[str], str]]] = queue.Queue()
         num_workers = os.cpu_count() or 4
-        self.workers = []
+        self.workers: List[threading.Thread] = []
         for _ in range(num_workers):
             t = threading.Thread(target=self._process_asset_creation_queue, daemon=True)
             t.start()
             self.workers.append(t)
 
-    def create_database_schema(self):
+    def create_database_schema(self) -> None:
         queries = [
+            'CREATE TABLE IF NOT EXISTS vault_properties (key TEXT PRIMARY KEY, value TEXT);',
             'CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, description TEXT, order_index INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP );',
             'CREATE TABLE IF NOT EXISTS collections (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), parent_id INTEGER REFERENCES collections(id), name TEXT, type TEXT, order_index INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP );',
             'CREATE TABLE IF NOT EXISTS assets (id INTEGER PRIMARY KEY, collection_id INTEGER REFERENCES collections(id), type TEXT NOT NULL, format TEXT, manifest TEXT, order_index INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP );',
@@ -1254,7 +1268,7 @@ class CompactVaultManager:
                     logging.error(f"Schema error: {e}")
             self.conn.commit()
 
-    def _ensure_schema_extensions(self):
+    def _ensure_schema_extensions(self) -> None:
         with self.lock:
             c = self.conn.cursor()
             try:
@@ -1277,7 +1291,40 @@ class CompactVaultManager:
             except sqlite3.Error as e:
                 logging.error(f"Extension error: {e}")
 
-    def _migrate_to_chunked_storage(self, cursor):
+    def set_password(self, password: str) -> None:
+        """Hashes and stores the vault password."""
+        with self.lock:
+            salt = os.urandom(16)
+            pw_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+            self.conn.execute("INSERT OR REPLACE INTO vault_properties (key, value) VALUES (?, ?)", ('password_salt', salt.hex()))
+            self.conn.execute("INSERT OR REPLACE INTO vault_properties (key, value) VALUES (?, ?)", ('password_hash', pw_hash.hex()))
+            self.conn.commit()
+
+    def check_password(self, password: str) -> bool:
+        """Checks if the provided password is correct."""
+        with self.lock:
+            try:
+                cur = self.conn.cursor()
+                cur.execute("SELECT value FROM vault_properties WHERE key = 'password_salt'")
+                salt_row = cur.fetchone()
+                cur.execute("SELECT value FROM vault_properties WHERE key = 'password_hash'")
+                hash_row = cur.fetchone()
+
+                if not salt_row or not hash_row:
+                    # If no password is set, allow access (for initial setup)
+                    return True
+
+                salt = bytes.fromhex(salt_row[0])
+                stored_hash = bytes.fromhex(hash_row[0])
+                
+                new_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+                
+                return new_hash == stored_hash
+            except (sqlite3.Error, ValueError) as e:
+                logging.error(f"Password check error: {e}")
+                return False
+
+    def _migrate_to_chunked_storage(self, cursor: sqlite3.Cursor) -> None:
         with self.lock:
             try:
                 CHUNK_SIZE = 256 * 1024
@@ -1287,7 +1334,7 @@ class CompactVaultManager:
                 for asset in c.execute("SELECT * FROM assets").fetchall():
                     asset_id = asset['id']
                     if 'data' in asset and asset['data']:
-                        manifest = {'chunks': [], 'size': asset.get('size_original', len(asset['data']))}
+                        manifest: Dict[str, Any] = {'chunks': [], 'size': asset.get('size_original', len(asset['data']))}
                         data = zlib.decompress(asset['data']) if asset.get('compression') == 'zlib' else asset['data']
                         for i in range(0, len(data), CHUNK_SIZE):
                             chunk_data = data[i:i + CHUNK_SIZE]
@@ -1295,7 +1342,7 @@ class CompactVaultManager:
                             compressed = zlib.compress(chunk_data, level=9)
                             manifest['chunks'].append(h)
                             c.execute("INSERT OR IGNORE INTO chunks (hash, data) VALUES (?, ?)", (h, compressed))
-                        manifest_str = json.dumps(manifest)
+                        manifest_str: Optional[str] = json.dumps(manifest)
                     else: manifest_str = None
                     c.execute("INSERT INTO assets_new (id, collection_id, type, format, manifest, created_at) VALUES (?, ?, ?, ?, ?, ?)", (asset['id'], asset['collection_id'], asset['type'], asset['format'], manifest_str, asset['created_at']))
                 c.execute("DROP TABLE assets")
@@ -1305,7 +1352,7 @@ class CompactVaultManager:
             except sqlite3.Error as e:
                 logging.error(f"Migration error: {e}")
 
-    def _process_asset_creation_queue(self):
+    def _process_asset_creation_queue(self) -> None:
         while True:
             try:
                 task = self.asset_creation_queue.get()
@@ -1316,7 +1363,7 @@ class CompactVaultManager:
             except Exception as e:
                 logging.error(f"Error in asset creation worker: {e}")
 
-    def create_asset_from_chunks(self, collection_id, chunk_paths, filename):
+    def create_asset_from_chunks(self, collection_id: int, chunk_paths: List[str], filename: str) -> int:
         try:
             file_extension = filename.split('.')[-1].lower() if '.' in filename else 'binary'
             asset_type_map = {
@@ -1329,8 +1376,8 @@ class CompactVaultManager:
             }
             asset_type = asset_type_map.get(file_extension, 'binary')
 
-            manifest = {'chain': [], 'total_size': 0, 'filename': filename}
-            previous_block_hash = None
+            manifest: Dict[str, Any] = {'chain': [], 'total_size': 0, 'filename': filename}
+            previous_block_hash: Optional[str] = None
 
             for chunk_path in chunk_paths:
                 try:
@@ -1394,7 +1441,7 @@ class CompactVaultManager:
             except (OSError, IndexError): pass
             raise
 
-    def get_or_create_collection_from_path(self, base_collection_id, path_prefix):
+    def get_or_create_collection_from_path(self, base_collection_id: int, path_prefix: str) -> int:
         with self.lock:
             if not path_prefix:
                 return base_collection_id
@@ -1421,78 +1468,74 @@ class CompactVaultManager:
             self.conn.commit()
             return current_parent_id
 
-    def get_assets_for_collection(self, collection_id, offset=0, limit=50, tag=None, query=None):
+    def _get_all_assets_for_collection(self, collection_id: int, tag: Optional[str]) -> List[Dict[str, Any]]:
+        base_sql = 'SELECT a.id, a.manifest, m.value as filename FROM assets a LEFT JOIN metadata m ON a.id = m.asset_id AND m.key = "filename" WHERE a.collection_id = ?'
+        params: List[Any] = [collection_id]
+        if tag:
+            base_sql += ' AND a.id IN (SELECT asset_id FROM metadata WHERE key = "tags" AND value LIKE ?)'
+            params.append(f'%{re.escape(tag)}%')
+
+        all_assets_cursor = self.conn.execute(base_sql, params)
+        
+        all_assets = []
+        for r in all_assets_cursor.fetchall():
+            filename = r['filename']
+            if not filename:
+                try:
+                    manifest = json.loads(r['manifest']) if r['manifest'] else {}
+                    filename = manifest.get('filename', 'Untitled')
+                except (json.JSONDecodeError, AttributeError):
+                    filename = 'Untitled'
+            all_assets.append({'id': r['id'], 'filename': filename})
+        return all_assets
+
+    def _filter_and_sort_assets(self, assets: List[Dict[str, Any]], query: Optional[str]) -> List[Dict[str, Any]]:
+        if query:
+            assets = [a for a in assets if query.lower() in a['filename'].lower()]
+        assets.sort(key=lambda x: natural_sort_key(x['filename']))
+        return assets
+
+    def _fetch_paginated_asset_details(self, asset_ids: List[int]) -> List[Dict[str, Any]]:
+        if not asset_ids:
+            return []
+
+        id_placeholders = ','.join('?' for _ in asset_ids)
+        sql = f'SELECT a.id, a.type, a.format, a.manifest, m.value as filename FROM assets a LEFT JOIN metadata m ON a.id = m.asset_id AND m.key = "filename" WHERE a.id IN ({id_placeholders})'
+        
+        cur = self.conn.execute(sql, asset_ids)
+        asset_details_map = {r['id']: dict(r) for r in cur.fetchall()}
+
+        results = []
+        for asset_id in asset_ids:
+            row = asset_details_map.get(asset_id)
+            if not row: continue
+
+            manifest = json.loads(row['manifest']) if row['manifest'] else {}
+            if not row['filename']:
+                row['filename'] = manifest.get('filename', 'Untitled')
+            row['size_original'] = manifest.get('total_size', 0)
+            del row['manifest']
+            results.append(row)
+        return results
+
+    def get_assets_for_collection(self, collection_id: int, offset: int = 0, limit: int = 50, tag: Optional[str] = None, query: Optional[str] = None) -> Dict[str, Any]:
         with self.lock:
             try:
-                # 1. Fetch all IDs, manifests, and joined filenames with filtering
-                base_sql = 'SELECT a.id, a.manifest, m.value as filename FROM assets a LEFT JOIN metadata m ON a.id = m.asset_id AND m.key = "filename" WHERE a.collection_id = ?'
-                params = [collection_id]
-                if tag:
-                    base_sql += ' AND a.id IN (SELECT asset_id FROM metadata WHERE key = "tags" AND value LIKE ?)'
-                    params.append(f'%{re.escape(tag)}%')
-
-                all_assets_cursor = self.conn.execute(base_sql, params)
+                all_assets = self._get_all_assets_for_collection(collection_id, tag)
+                sorted_assets = self._filter_and_sort_assets(all_assets, query)
                 
-                # Create the list, including the fallback logic for filenames
-                all_assets = []
-                for r in all_assets_cursor.fetchall():
-                    filename = r['filename']
-                    if not filename:
-                        try:
-                            manifest = json.loads(r['manifest']) if r['manifest'] else {}
-                            filename = manifest.get('filename', 'Untitled')
-                        except (json.JSONDecodeError, AttributeError):
-                            filename = 'Untitled'
-                    all_assets.append({'id': r['id'], 'filename': filename})
-
-                # Apply search query in Python
-                if query:
-                    all_assets = [a for a in all_assets if query.lower() in a['filename'].lower()]
-
-                # 2. Sort naturally in Python
-                all_assets.sort(key=lambda x: natural_sort_key(x['filename']))
-
-                # 3. Get total count
-                total = len(all_assets)
-
-                # 4. Get the slice of IDs for the current page
-                paginated_ids = [a['id'] for a in all_assets[offset:offset + limit]]
-
-                # 5. If no IDs for this page, return empty
-                if not paginated_ids:
-                    return {'assets': [], 'total': total}
-
-                # 6. Fetch full data for these paginated IDs
-                id_placeholders = ','.join('?' for _ in paginated_ids)
-                sql = f'SELECT a.id, a.type, a.format, a.manifest, m.value as filename FROM assets a LEFT JOIN metadata m ON a.id = m.asset_id AND m.key = "filename" WHERE a.id IN ({id_placeholders})'
+                total = len(sorted_assets)
+                paginated_ids = [a['id'] for a in sorted_assets[offset:offset + limit]]
                 
-                cur = self.conn.execute(sql, paginated_ids)
-                
-                # 7. Create a mapping from id -> details
-                asset_details_map = {r['id']: dict(r) for r in cur.fetchall()}
+                paginated_assets = self._fetch_paginated_asset_details(paginated_ids)
 
-                # 8. Create the final results list in the correct order
-                results = []
-                for asset_id in paginated_ids:
-                    row = asset_details_map.get(asset_id)
-                    if not row: continue
-
-                    manifest = json.loads(row['manifest']) if row['manifest'] else {}
-                    # Re-apply filename logic for the final output
-                    if not row['filename']:
-                        row['filename'] = manifest.get('filename', 'Untitled')
-                    row['size_original'] = manifest.get('total_size', 0)
-                    del row['manifest']
-                    results.append(row)
-
-                # 9. Return final data
-                return {'assets': results, 'total': total}
+                return {'assets': paginated_assets, 'total': total}
 
             except (sqlite3.Error, json.JSONDecodeError) as e:
                 logging.error(f"Get assets error: {e}")
                 return {'assets': [], 'total': 0}
 
-    def get_asset_metadata(self, asset_id):
+    def get_asset_metadata(self, asset_id: int) -> Optional[Dict[str, Any]]:
         """Gets asset metadata without loading data."""
         with self.lock:
             row = self.conn.execute("SELECT manifest FROM assets WHERE id=?", (asset_id,)).fetchone()
@@ -1503,14 +1546,14 @@ class CompactVaultManager:
             size = manifest.get('total_size', 0)
             return {'filename': filename, 'mime': mime, 'size': size, 'manifest_str': row['manifest']}
 
-    def get_manifest(self, asset_id):
+    def get_manifest(self, asset_id: int) -> Optional[Dict[str, Any]]:
         with self.lock:
             row = self.conn.execute("SELECT manifest FROM assets WHERE id=?", (asset_id,)).fetchone()
             if not row or not row['manifest']:
                 return None
             return json.loads(row['manifest'])
 
-    def stream_asset_range(self, asset_id, start_byte, end_byte):
+    def stream_asset_range(self, asset_id: int, start_byte: int, end_byte: int) -> Iterator[bytes]:
         manifest = self.get_manifest(asset_id)
         if not manifest:
             return
@@ -1549,7 +1592,7 @@ class CompactVaultManager:
             if current_pos > end_byte:
                 break
 
-    def stream_asset_data(self, asset_id):
+    def stream_asset_data(self, asset_id: int) -> Iterator[bytes]:
         """Yields asset data chunk by chunk for streaming."""
         manifest = self.get_manifest(asset_id)
         if not manifest:
@@ -1567,10 +1610,10 @@ class CompactVaultManager:
                     logging.error(f"Failed to decompress chunk {chunk_hash} for asset {asset_id}")
                     continue
 
-    def get_asset_ids_with_paths_for_collection(self, collection_id, base_path=""):
+    def get_asset_ids_with_paths_for_collection(self, collection_id: int, base_path: str = "") -> List[Tuple[int, str]]:
         """Recursively gets asset IDs and their zip paths for a collection."""
         with self.lock:
-            results = []
+            results: List[Tuple[int, str]] = []
             coll = self.get_collection(collection_id)
             if not coll: return []
 
@@ -1586,10 +1629,10 @@ class CompactVaultManager:
                 results.extend(self.get_asset_ids_with_paths_for_collection(sub['id'], current_path))
             return results
 
-    def get_asset_ids_with_paths_for_project(self, project_id):
+    def get_asset_ids_with_paths_for_project(self, project_id: int) -> List[Tuple[int, str]]:
         """Gets all asset IDs and their zip paths for a project."""
         with self.lock:
-            results = []
+            results: List[Tuple[int, str]] = []
             proj = self.get_project(project_id)
             if not proj: return []
             base_path = proj['name'] + '/'
@@ -1598,7 +1641,7 @@ class CompactVaultManager:
                 results.extend(self.get_asset_ids_with_paths_for_collection(top['id'], base_path))
             return results
 
-    def write_asset_to_zip(self, asset_id, zf, path_in_zip):
+    def write_asset_to_zip(self, asset_id: int, zf: zipfile.ZipFile, path_in_zip: str) -> None:
         """Streams an asset's data directly into a ZipFile object."""
         info = zipfile.ZipInfo(path_in_zip, time.localtime())
         info.compress_type = zipfile.ZIP_STORED
@@ -1606,7 +1649,7 @@ class CompactVaultManager:
             for chunk in self.stream_asset_data(asset_id):
                 asset_file.write(chunk)
 
-    def create_project(self, name, type, description):
+    def create_project(self, name: str, type: str, description: str) -> int:
         with self.lock:
             try:
                 cur = self.conn.cursor()
@@ -1617,7 +1660,7 @@ class CompactVaultManager:
                 logging.error(f"Create project error: {e}")
                 raise
 
-    def get_all_projects(self):
+    def get_all_projects(self) -> List[Dict[str, Any]]:
         with self.lock:
             try:
                 cur = self.conn.execute("SELECT * FROM projects ORDER BY order_index ASC, name")
@@ -1626,7 +1669,7 @@ class CompactVaultManager:
                 logging.error(f"Get all projects error: {e}")
                 return []
 
-    def create_collection(self, project_id, name, type, parent_id):
+    def create_collection(self, project_id: int, name: str, type: str, parent_id: Optional[int]) -> int:
         with self.lock:
             try:
                 cur = self.conn.cursor()
@@ -1637,7 +1680,7 @@ class CompactVaultManager:
                 logging.error(f"Create collection error: {e}")
                 raise
 
-    def get_collections_for_project(self, project_id):
+    def get_collections_for_project(self, project_id: int) -> List[Dict[str, Any]]:
         with self.lock:
             try:
                 cur = self.conn.execute("SELECT * FROM collections WHERE project_id = ? ORDER BY order_index ASC, name", (project_id,))
@@ -1646,7 +1689,7 @@ class CompactVaultManager:
                 logging.error(f"Get collections for project error: {e}")
                 return []
 
-    def get_project(self, project_id):
+    def get_project(self, project_id: int) -> Optional[Dict[str, Any]]:
         with self.lock:
             try:
                 cur = self.conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
@@ -1656,7 +1699,7 @@ class CompactVaultManager:
                 logging.error(f"Get project error: {e}")
                 return None
 
-    def get_collection(self, collection_id):
+    def get_collection(self, collection_id: int) -> Optional[Dict[str, Any]]:
         with self.lock:
             try:
                 cur = self.conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,))
@@ -1666,7 +1709,7 @@ class CompactVaultManager:
                 logging.error(f"Get collection error: {e}")
                 return None
 
-    def get_asset_preview(self, asset_id):
+    def get_asset_preview(self, asset_id: int) -> Optional[Dict[str, Any]]:
         with self.lock:
             try:
                 row = self.conn.execute('SELECT a.id, a.type, a.format, a.manifest, (SELECT value FROM metadata m WHERE m.asset_id=a.id AND m.key="filename" LIMIT 1) as filename FROM assets a WHERE a.id = ?', (asset_id,)).fetchone()
@@ -1701,6 +1744,12 @@ class CompactVaultManager:
                 logging.error(f"Unexpected preview error: {e}")
                 return None
 
+    def vacuum(self) -> None:
+        """Optimizes the database file."""
+        with self.lock:
+            self.conn.execute("VACUUM;")
+            self.conn.commit()
+
 # endregion
 
 HTML_SELECTOR_TEMPLATE = """
@@ -1714,27 +1763,75 @@ HTML_SELECTOR_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h1>Select a Vault</h1>
+        <h1>Select or Create a Vault</h1>
         <div id="file-list">
             {file_links}
         </div>
+        <div id="unlock-section" class="hidden">
+            <h2 id="unlock-title">Unlock Vault</h2>
+            <input type="password" id="unlock-password" placeholder="Enter vault password">
+            <button onclick="unlockVault()">Unlock</button>
+        </div>
         <div class="new-vault">
-            <input type="text" id="new-vault-name" placeholder="Enter new vault name">
-            <button onclick="createDb()">Create New Vault</button>
+            <h2>Create New Vault</h2>
+            <input type="text" id="new-vault-name" placeholder="Vault name (default: default.vault)">
+            <input type="password" id="new-vault-password" placeholder="Enter password">
+            <input type="password" id="new-vault-password-confirm" placeholder="Confirm password">
+            <button onclick="createVault()">Create New Vault</button>
         </div>
     </div>
     <script>
+        let selectedDb = null;
+
         function selectDb(db_name) {
-            fetch('/api/select_db', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ db: db_name })
-            }).then(() => location.reload());
+            selectedDb = db_name;
+            document.getElementById('unlock-section').classList.remove('hidden');
+            document.getElementById('unlock-title').textContent = `Unlock ${db_name}`;
         }
-        function createDb() {
-            const name = document.getElementById('new-vault-name').value;
-            if (name) {
-                selectDb(name + '.vault');
+
+        function unlockVault() {
+            const password = document.getElementById('unlock-password').value;
+            if (selectedDb && password) {
+                fetch('/api/unlock_vault', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ db: selectedDb, password: password })
+                }).then(res => {
+                    if (res.ok) {
+                        location.reload();
+                    } else {
+                        alert('Invalid password');
+                    }
+                });
+            }
+        }
+
+        function createVault() {
+            let name = document.getElementById('new-vault-name').value;
+            const password = document.getElementById('new-vault-password').value;
+            const passwordConfirm = document.getElementById('new-vault-password-confirm').value;
+
+            if (password !== passwordConfirm) {
+                alert('Passwords do not match!');
+                return;
+            }
+
+            if (!name) {
+                name = 'default';
+            }
+
+            if (name && password) {
+                fetch('/api/create_vault', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ db: name + '.vault', password: password })
+                }).then(res => {
+                    if (res.ok) {
+                        location.reload();
+                    } else {
+                        alert('Failed to create vault');
+                    }
+                });
             }
         }
     </script>
@@ -1748,29 +1845,19 @@ body { font-family: sans-serif; background-color: #121212; color: #e0e0e0; displ
 h1 { color: #1fb6ff; }
 #file-list a { display: block; padding: 0.5rem 1rem; margin: 0.5rem 0; background: #333; color: #e0e0e0; text-decoration: none; border-radius: 4px; transition: background-color 0.2s; }
 #file-list a:hover { background-color: #1fb6ff; color: #121212; }
-.new-vault { margin-top: 1.5rem; }
-#new-vault-name { padding: 0.5rem; border-radius: 4px; border: 1px solid #333; background: #222; color: #e0e0e0; }
+.new-vault, #unlock-section { margin-top: 1.5rem; }
+#new-vault-name, #new-vault-password, #new-vault-password-confirm, #unlock-password { padding: 0.5rem; border-radius: 4px; border: 1px solid #333; background: #222; color: #e0e0e0; margin-bottom: 0.5rem; width: calc(100% - 1rem); }
 button { padding: 0.5rem 1rem; border: none; border-radius: 4px; background-color: #1fb6ff; color: #121212; cursor: pointer; transition: background-color 0.2s; }
 button:hover { background-color: #1ca0d3; }
+.hidden { display: none; }
 """
 
-class RateLimiter:
-    def __init__(self, requests_per_minute=60):
-        self.requests_per_minute = requests_per_minute
-        self.last_request = defaultdict(list)
 
-    def is_allowed(self, ip):
-        now = time.time()
-        self.last_request[ip] = [t for t in self.last_request[ip] if now - t < 60]
-        if len(self.last_request[ip]) >= self.requests_per_minute:
-            return False
-        self.last_request[ip].append(now)
-        return True
 
 class RequestHandler(http.server.BaseHTTPRequestHandler):
-    rate_limiter = RateLimiter(requests_per_minute=300)
-    routes = {
+    routes: Dict[str, List[Tuple[str, str]]] = {
         'GET': [
+            (r'^/favicon.ico$', 'handle_favicon'),
             (r'^/api/projects$', 'api_get_all_projects'),
             (r'^/api/projects/(\d+)$', 'api_get_project'),
             (r'^/api/projects/(\d+)/collections$', 'api_get_project_collections'),
@@ -1782,32 +1869,25 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             (r'^/api/collections/(\d+)/download$', 'api_download_collection'),
         ],
         'POST': [
+            (r'^/api/create_vault$', 'api_create_vault'),
+            (r'^/api/unlock_vault$', 'api_unlock_vault'),
             (r'^/api/projects$', 'api_create_project'),
             (r'^/api/collections$', 'api_create_collection'),
             (r'^/api/upload/chunk$', 'api_upload_chunk'),
             (r'^/api/upload/complete$', 'api_complete_upload'),
             (r'^/api/maintenance/vacuum$', 'api_vacuum'),
-            (r'^/api/select_db$', 'api_select_db'),
             (r'^/api/collections/(\d+)/assets/download$', 'handle_bulk_download'),
         ],
     }
 
-    def __init__(self, request, client_address, server):
+    def __init__(self, request: bytes, client_address: Tuple[str, int], server: http.server.HTTPServer) -> None:
         super().__init__(request, client_address, server)
 
-    def check_auth(self):
-        auth = self.headers.get('Authorization')
-        if not auth: return False
-        scheme, credentials = auth.split(maxsplit=1)
-        if scheme.lower() != 'basic': return False
-        username, password = base64.b64decode(credentials).decode().split(':', maxsplit=1)
-        return password == HARDCODED_PASSWORD
-
-    def do_HEAD(self):
+    def do_HEAD(self) -> None:
         self.send_response(200)
         self.end_headers()
 
-    def handle_one_request(self):
+    def handle_one_request(self) -> None:
         try:
             self.raw_requestline = self.rfile.readline(65537)
             if len(self.raw_requestline) > 65536:
@@ -1819,19 +1899,13 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             if not self.parse_request():
                 return
 
-            ip = self.client_address[0]
-            if not (self.path.startswith('/api/upload/chunk') or self.path.startswith('/api/upload/complete')):
-                if not self.rate_limiter.is_allowed(ip):
-                    self.requestline = ""
-                    self.send_error(429, "Too Many Requests")
-                    return
-            # Skip auth check when no manager is set (initial DB selection)
-            if self.command != 'OPTIONS' and not (not self.server.app_state["manager"] and (self.path == '/' or self.path.startswith('/api/select_db'))):
-                if not self.check_auth():
-                    self.send_response(401)
-                    self.send_header('WWW-Authenticate', 'Basic realm="CompactVault"')
-                    self.end_headers()
-                    return
+            # New authentication flow
+            if self.command != 'OPTIONS':
+                # Allow access to the main page and unlock/create vault endpoints
+                if self.path not in ('/', '/api/unlock_vault', '/api/create_vault'):
+                    if not self.server.app_state.get("manager"):
+                        self.send_error(401, "Unauthorized: No vault unlocked")
+                        return
 
             mname = 'do_' + self.command
             if hasattr(self, mname):
@@ -1840,16 +1914,16 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         except socket.timeout as e:
             self.log_error("Request timed out: %r", e)
 
-    def _send_json(self, obj, code=200):
+    def _send_json(self, obj: Any, code: int = 200) -> None:
         data = json.dumps(obj, default=str).encode('utf-8')
         headers = {'Content-Type':'application/json'}
         self._send_compressed(data, code, headers)
 
-    def _send_raw(self, data, status=200, headers=None):
+    def _send_raw(self, data: bytes, status: int = 200, headers: Optional[Dict[str, str]] = None) -> None:
         headers = headers or {}
         self._send_compressed(data, status, headers)
 
-    def _send_compressed(self, data, code, headers):
+    def _send_compressed(self, data: bytes, code: int, headers: Dict[str, str]) -> None:
         accept = self.headers.get('Accept-Encoding', '').lower()
         if 'gzip' in accept and len(data) > 200:
             data = gzip.compress(data, compresslevel=6)
@@ -1865,20 +1939,20 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_OPTIONS(self):
+    def do_OPTIONS(self) -> None:
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header('Access-control-allow-methods','GET,POST,OPTIONS')
         self.send_header('Access-Control-Allow-Headers','Content-Type,Range,Authorization')
         self.end_headers()
 
-    def require_manager(self):
+    def require_manager(self) -> bool:
         if not self.server.app_state.get("manager"):
             self._send_json({"message": "No database selected"}, 400)
             return False
         return True
 
-    def route_request(self, method):
+    def route_request(self, method: str) -> None:
         for pattern, handler_name in self.routes.get(method, []):
             m = re.match(pattern, self.path.split('?')[0])
             if m:
@@ -1887,7 +1961,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 return
         self.send_error(404)
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.path == '/':
             if not self.server.app_state["manager"]:
                 self.show_db_selector()
@@ -1899,20 +1973,24 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.route_request('GET')
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         self.route_request('POST')
 
-    def show_db_selector(self):
+    def handle_favicon(self) -> None:
+        self.send_response(204)
+        self.end_headers()
+
+    def show_db_selector(self) -> None:
         files = [f for f in os.listdir('.') if f.endswith('.vault')]
         file_links = ' '.join(f'<a href="#" onclick="selectDb(\'{f}\')">{f}</a>' for f in files)
         html = HTML_SELECTOR_TEMPLATE.replace('{css}', CSS_SELECTOR_STYLES).replace('{file_links}', file_links)
         self._send_raw(html.encode('utf-8'), headers={'Content-Type': 'text/html'})
 
-    def api_get_all_projects(self):
+    def api_get_all_projects(self) -> None:
         if not self.require_manager(): return
         self._send_json(self.server.app_state["manager"].get_all_projects())
 
-    def api_get_project(self, project_id_str):
+    def api_get_project(self, project_id_str: str) -> None:
         if not self.require_manager(): return
         try:
             project_id = int(project_id_str)
@@ -1924,7 +2002,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             self._send_json({'message': 'Invalid project ID'}, 400)
 
-    def api_create_project(self):
+    def api_create_project(self) -> None:
         if not self.require_manager(): return
         try:
             length = int(self.headers.get('content-length'))
@@ -1940,7 +2018,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json({'message': f'Create failed: {e}'}, 500)
 
-    def api_get_project_collections(self, project_id_str):
+    def api_get_project_collections(self, project_id_str: str) -> None:
         if not self.require_manager(): return
         try:
             project_id = int(project_id_str)
@@ -1948,7 +2026,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             self._send_json({'message': 'Invalid project ID'}, 400)
 
-    def api_get_collection(self, collection_id_str):
+    def api_get_collection(self, collection_id_str: str) -> None:
         if not self.require_manager(): return
         try:
             collection_id = int(collection_id_str)
@@ -1960,7 +2038,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             self._send_json({'message': 'Invalid collection ID'}, 400)
 
-    def api_create_collection(self):
+    def api_create_collection(self) -> None:
         if not self.require_manager(): return
         try:
             length = int(self.headers.get('content-length'))
@@ -1977,7 +2055,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json({'message': f'Create failed: {e}'}, 500)
 
-    def api_get_collection_assets(self, collection_id_str):
+    def api_get_collection_assets(self, collection_id_str: str) -> None:
         if not self.require_manager(): return
         try:
             collection_id = int(collection_id_str)
@@ -1990,7 +2068,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             self._send_json({'message': 'Invalid collection ID'}, 400)
 
-    def handle_asset_preview(self, asset_id_str):
+    def handle_asset_preview(self, asset_id_str: str) -> None:
         if not self.require_manager(): return
         try:
             asset_id = int(asset_id_str)
@@ -2002,7 +2080,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             self._send_json({'message': 'Invalid asset ID'}, 400)
 
-    def handle_asset_download(self, asset_id_str):
+    def handle_asset_download(self, asset_id_str: str) -> None:
         if not self.require_manager(): return
         try:
             asset_id = int(asset_id_str)
@@ -2056,7 +2134,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             logging.error(f"Download error: {e}")
             self.send_error(500)
 
-    def handle_bulk_download(self, collection_id_str):
+    def handle_bulk_download(self, collection_id_str: str) -> None:
         if not self.require_manager(): return
         try:
             length = int(self.headers.get('content-length'))
@@ -2079,27 +2157,62 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             logging.error(f"Bulk download error: {e}")
             self.send_error(500)
 
-    def api_vacuum(self):
-        if not self.require_manager(): return
-        self.server.app_state["manager"].vacuum()
-        self._send_json({'message': 'VACUUM complete'})
-
-    def api_select_db(self):
+    def api_unlock_vault(self) -> None:
         try:
             length = int(self.headers.get('content-length'))
             body = json.loads(self.rfile.read(length))
             db_name = body.get('db')
-            if db_name and db_name.endswith('.vault'):
-                self.server.app_state["db_path"] = db_name
-                self.server.app_state["manager"] = CompactVaultManager(db_name)
-                self.server.app_state["rendered_html"] = HTML_TEMPLATE.replace('{css}', CSS_STYLES).replace('{js}', JAVASCRIPT_CODE).encode('utf-8')
-                self._send_json({'message': f'Switched to {db_name}'})
-            else:
-                self._send_json({'message': 'Invalid DB name'}, 400)
-        except Exception as e:
-            self._send_json({'message': f'DB switch failed: {e}'}, 500)
+            password = body.get('password')
 
-    def api_upload_chunk(self):
+            if not db_name or not password or not db_name.endswith('.vault'):
+                self._send_json({'message': 'Invalid request'}, 400)
+                return
+
+            manager = CompactVaultManager(db_name)
+            if manager.check_password(password):
+                self.server.app_state["db_path"] = db_name
+                self.server.app_state["manager"] = manager
+                self.server.app_state["rendered_html"] = HTML_TEMPLATE.replace('{css}', CSS_STYLES).replace('{js}', JAVASCRIPT_CODE).encode('utf-8')
+                self._send_json({'message': f'Unlocked {db_name}'})
+            else:
+                self._send_json({'message': 'Invalid password'}, 401)
+
+        except Exception as e:
+            self._send_json({'message': f'Vault unlock failed: {e}'}, 500)
+
+    def api_create_vault(self) -> None:
+        try:
+            length = int(self.headers.get('content-length'))
+            body = json.loads(self.rfile.read(length))
+            db_name = body.get('db')
+            password = body.get('password')
+
+            if not db_name or not password or not db_name.endswith('.vault'):
+                self._send_json({'message': 'Invalid request'}, 400)
+                return
+
+            if os.path.exists(db_name):
+                self._send_json({'message': 'Vault already exists'}, 400)
+                return
+
+            manager = CompactVaultManager(db_name)
+            manager.set_password(password)
+            self._send_json({'message': f'Created and unlocked {db_name}'}, 201)
+
+            # Automatically unlock the new vault
+            self.server.app_state["db_path"] = db_name
+            self.server.app_state["manager"] = manager
+            self.server.app_state["rendered_html"] = HTML_TEMPLATE.replace('{css}', CSS_STYLES).replace('{js}', JAVASCRIPT_CODE).encode('utf-8')
+
+        except Exception as e:
+            self._send_json({'message': f'Vault creation failed: {e}'}, 500)
+
+    def api_vacuum(self) -> None:
+        if not self.require_manager(): return
+        self.server.app_state["manager"].vacuum()
+        self._send_json({'message': 'VACUUM complete'})
+
+    def api_upload_chunk(self) -> None:
         try:
             qs = parse_qs(urlparse(self.path).query)
             upload_id = qs.get('upload_id', [None])[0]
@@ -2128,7 +2241,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             logging.error(f"Chunk upload failed: {e}")
             self._send_json({'message': f'Chunk upload failed: {e}'}, 500)
 
-    def api_complete_upload(self):
+    def api_complete_upload(self) -> None:
         if not self.require_manager(): return
         try:
             length = int(self.headers.get('content-length'))
@@ -2161,7 +2274,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json({'message': f'Upload completion failed: {e}'}, 500)
 
-    def api_download_project(self, project_id_str):
+    def api_download_project(self, project_id_str: str) -> None:
         if not self.require_manager(): return
         try:
             project_id = int(project_id_str)
@@ -2187,7 +2300,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             logging.error(f"Project download error: {e}")
             self.send_error(500)
 
-    def api_download_collection(self, collection_id_str):
+    def api_download_collection(self, collection_id_str: str) -> None:
         if not self.require_manager(): return
         try:
             collection_id = int(collection_id_str)
@@ -2213,26 +2326,17 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             logging.error(f"Collection download error: {e}")
             self.send_error(500)
 
-def run(server_class=ThreadedHTTPServer, handler_class=RequestHandler, port=8000):
+def run(server_class: type = ThreadedHTTPServer, handler_class: type = RequestHandler, port: int = 8000) -> None:
     # Server state
-    db_path = None
-    manager = None
-    rendered_html = None
-
-    # Check for existing vaults
-    vaults = [f for f in os.listdir('.') if f.endswith('.vault')]
-    if not vaults:
-        logging.info("No vaults found, creating 'default.vault'")
-        db_path = "default.vault"
-        manager = CompactVaultManager(db_path)
-
-    if manager:
-        rendered_html = HTML_TEMPLATE.replace('{css}', CSS_STYLES).replace('{js}', JAVASCRIPT_CODE).encode('utf-8')
+    db_path: Optional[str] = None
+    manager: Optional[CompactVaultManager] = None
+    rendered_html: Optional[bytes] = None
 
     server_class.app_state = {
         "db_path": db_path,
         "manager": manager,
-        "rendered_html": rendered_html
+        "rendered_html": rendered_html,
+        "password": None  # No global password
     }
 
     # Find a free port
@@ -2248,7 +2352,7 @@ def run(server_class=ThreadedHTTPServer, handler_class=RequestHandler, port=8000
                 raise
 
     # Graceful shutdown
-    def signal_handler(sig, frame):
+    def signal_handler(sig: int, frame: Any) -> None:
         logging.info('Shutting down server...')
         try:
             if server.app_state.get("manager"):
