@@ -20,7 +20,7 @@ The database schema is designed for efficient storage and retrieval of chunked a
 
 *   **`vault_properties` Table:** A dedicated table for storing vault-specific metadata, such as the password hash and salt.
 *   **Write-Ahead Logging (WAL):** The database operates in WAL mode to improve concurrency and write performance. A graceful shutdown mechanism (`signal_handler` for Ctrl+C) is implemented to run a database checkpoint, which commits all changes from the `.wal` log file into the main database and ensures the temporary files are cleanly removed.
-*   **Filename Sort Index:** A dedicated database index has been created on the `value` column of the `metadata` table. This index specifically accelerates the natural sorting of assets by their filename, which is the default view in the application.
+*   **Server-Side Sorting:** All asset sorting is handled by the database, with support for sorting by filename and size. This is much more efficient than the previous client-side sorting implementation.
 *   **Manual `VACUUM`:** The application provides a UI button to trigger the `VACUUM` command. This allows the user to manually reclaim unused space and optimize the database file.
 
 The `CompactVaultManager` provides methods for adding and reading data, but **intentionally lacks methods for editing or deleting assets**. The API exposed by the `RequestHandler` reflects this; there are no `PUT`, `PATCH`, or `DELETE` endpoints for assets. This architectural constraint is the primary mechanism for ensuring the permanence of the archive.
@@ -41,8 +41,8 @@ This system provides two key benefits for a permanent archive:
 
 The frontend is a dependency-free, single-page application (SPA) written in vanilla JavaScript (ES6+). The HTML, CSS, and JavaScript are embedded as strings within `server.py`.
 
--   **Virtual Rendering:** The asset list uses virtual scrolling, rendering only the visible items in the DOM. This ensures the UI remains fast and responsive even with thousands of assets.
--   **Backend-Driven Logic:** The frontend is designed to be a "dumb" client. It is primarily responsible for rendering the data provided by the backend. Crucial logic, such as sorting, is handled entirely by the backend to ensure consistency.
+-   **Pagination:** The asset list is now paginated, with the server sending one page of assets at a time. This ensures the UI remains fast and responsive even with thousands of assets, without the complexity of virtual scrolling.
+-   **Backend-Driven Logic:** The frontend is designed to be a "dumb" client. It is primarily responsible for rendering the data provided by the backend. All crucial logic, such as filtering and sorting, is handled entirely by the backend to ensure consistency and performance.
 
 ## 5. Key Data Flows
 
@@ -56,7 +56,7 @@ The frontend is a dependency-free, single-page application (SPA) written in vani
 
 ### Asset Retrieval (Read Many)
 
-1.  The user navigates to a collection.
-2.  The frontend requests assets from `/api/collections/{id}/assets`.
-3.  The backend fetches all asset records for that collection, sorts them using a **natural sort algorithm** in memory, and returns only the paginated slice requested by the client.
+1.  The user navigates to a collection, or applies a filter or sort option.
+2.  The frontend requests a page of assets from `/api/collections/{id}/assets`, including any filter, sort, and pagination parameters.
+3.  The backend queries the database for the requested page of assets, applying the specified filters and sorting criteria at the database level.
 4.  For previews or downloads, the backend reads the asset's manifest and streams the constituent data chunks from the database in the correct order.
