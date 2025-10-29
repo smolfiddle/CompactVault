@@ -911,6 +911,21 @@ document.addEventListener('DOMContentLoaded', () => {
       down.textContent = "Download";
       down.onclick = () => downloadAsset(`/api/assets/${asset_id}`, res.filename);
       btns.appendChild(down);
+
+      const dragLink = document.createElement("a");
+      dragLink.className = "btn";
+      dragLink.href = `/api/assets/${asset_id}`;
+      if (res.type === "video" || res.type === "audio") {
+        dragLink.textContent = "Drag to Player";
+      } else if (res.type === "image") {
+        dragLink.textContent = "View Image";
+      } else if (res.type === "text") {
+        dragLink.textContent = "View Raw";
+      } else {
+        dragLink.textContent = "Download Link";
+      }
+      dragLink.draggable = true;
+      btns.appendChild(dragLink);
       header.appendChild(btns);
       area.appendChild(header);
       const surface = document.createElement("div");
