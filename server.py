@@ -80,8 +80,15 @@ HTML_TEMPLATE = '''
         <select id="filter-by-type" class="small" aria-label="Filter by type">
           <option value="">All Types</option>
         </select>
+        <select id="sort-assets" class="small" aria-label="Sort by">
+          <option value="filename_asc">Name (A-Z)</option>
+          <option value="filename_desc">Name (Z-A)</option>
+          <option value="size_desc">Size (Largest)</option>
+          <option value="size_asc">Size (Smallest)</option>
+        </select>
       </div>
       <ul id="assets-list" class="list sortable" role="list"></ul>
+      <div id="assets-pagination" class="pagination-controls"></div>
     </section>
 
     <section class="col preview" role="region" aria-label="Preview">
@@ -460,6 +467,34 @@ body.light {
   margin-left: 12px;
   flex-shrink: 0;
 }
+.pagination-controls {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 8px;
+  border-top: var(--border);
+}
+.pagination-controls button {
+  margin: 0 4px;
+  padding: 4px 8px;
+  border-radius: var(--radius);
+  background: var(--bg-light);
+  border: 1px solid var(--border-color);
+  color: var(--fg-med);
+  cursor: pointer;
+}
+.pagination-controls button:hover {
+  background: #444;
+}
+.pagination-controls button.current {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.pagination-controls button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 '''
 
 # Revamped JavaScript with better structure, error handling, and features
@@ -511,12 +546,13 @@ document.addEventListener('DOMContentLoaded', () => {
     collections: [],
     collectionsTree: [],
     assets: [],
-    filteredAssets: [],
-    loadingMore: false,
-    offset: 0,
     limit: 50,
     total: 0,
+    page: 1,
     searchQuery: '',
+    filterByType: '',
+    sortBy: 'filename',
+    sortOrder: 'asc',
     selection: {project: null, collection: null, assets: new Set(), last: null},
     projectName: '',
     collectionName: ''
@@ -675,8 +711,7 @@ document.addEventListener('DOMContentLoaded', () => {
     state.collectionName = name;
     document.querySelectorAll("#collections-list .item").forEach(i => i.classList.remove("selected"));
     elItem.classList.add("selected");
-    state.offset = 0;
-    await loadAssets(id);
+    await loadAssets(id, 1);
   }
 
   function debounce(func, wait) {
@@ -691,58 +726,9 @@ document.addEventListener('DOMContentLoaded', () => {
     };
   }
 
-  function applyAssetFilter() {
-    const filter = el("filter-by-type").value;
-    state.filteredAssets = filter ? state.assets.filter(a => a.format === filter) : state.assets;
-    el("asset-count").textContent = `(${state.filteredAssets.length} of ${state.total})`;
-    renderVisibleAssets();
-  }
-
-  // Load assets
-  async function loadAssets(collection_id, append = false) {
-    try {
-      let path = `/collections/${collection_id}/assets?offset=${state.offset}&limit=${state.limit}`;
-      if (state.searchQuery) {
-        path += `&query=${encodeURIComponent(state.searchQuery)}`;
-      }
-      const res = await api(path);
-      state.assets = append ? state.assets.concat(res.assets) : res.assets;
-      state.total = res.total;
-
-      if (!append) {
-        const filterDropdown = el("filter-by-type");
-        const currentFilter = filterDropdown.value;
-        filterDropdown.innerHTML = "<option value=''>All Types</option>";
-        const allFormats = [...new Set(state.assets.map(a => a.format))].sort();
-        allFormats.forEach(f => {
-          const opt = document.createElement("option");
-          opt.value = opt.textContent = f;
-          filterDropdown.appendChild(opt);
-        });
-        filterDropdown.value = currentFilter;
-      }
-
-      applyAssetFilter();
-      return res;
-    } catch (e) {
-      toast(`Error loading assets: ${e.message}`, 'error');
-      throw e;
-    }
-  }
-
-  const renderVisibleAssets = () => {
+  function renderAssets() {
     const container = el("assets-list");
-    const itemHeight = 50;
-    const filtered = state.filteredAssets || [];
-
-    const scrollTop = container.scrollTop;
-    const visibleHeight = container.clientHeight;
-    const startIndex = Math.floor(scrollTop / itemHeight);
-    const endIndex = Math.min(startIndex + Math.ceil(visibleHeight / itemHeight) + 5, filtered.length);
-
-    const visibleAssets = filtered.slice(startIndex, endIndex);
-
-    const itemsHtml = visibleAssets.map(a => {
+    container.innerHTML = state.assets.map(a => {
       const isSelected = state.selection.assets.has(a.id.toString());
       return `
       <li class="item ${isSelected ? 'selected' : ''}" role="listitem" data-id="${a.id}">
@@ -753,36 +739,81 @@ document.addEventListener('DOMContentLoaded', () => {
         <div class="item-size">${(a.size_original / 1024).toFixed(1)} KB</div>
       </li>
     `}).join('');
+    el("asset-count").textContent = `(${state.assets.length} of ${state.total})`;
+  }
 
-    container.innerHTML = `
-      <div style="height: ${startIndex * itemHeight}px;"></div>
-      ${itemsHtml}
-      <div style="height: ${(filtered.length - endIndex) * itemHeight}px;"></div>
-    `;
-  };
+  function renderPagination() {
+    const container = el("assets-pagination");
+    const totalPages = Math.ceil(state.total / state.limit);
+    if (totalPages <= 1) {
+      container.innerHTML = '';
+      return;
+    }
 
-  const debouncedRender = debounce(renderVisibleAssets, 16);
+    let html = '';
+    for (let i = 1; i <= totalPages; i++) {
+      html += `<button class="${i === state.page ? 'current' : ''}" onclick="changePage(${i})">${i}</button>`;
+    }
+    container.innerHTML = html;
+  }
 
-  el("assets-list").addEventListener("scroll", () => {
-    const container = el("assets-list");
-    if (container.scrollTop + container.clientHeight >= container.scrollHeight - 200 && state.assets.length < state.total) {
-      if (!state.loadingMore) {
-        state.loadingMore = true;
-        state.offset += state.limit;
-        loadAssets(state.selection.collection, true).finally(() => {
-          state.loadingMore = false;
+  window.changePage = (page) => {
+    if (page !== state.page) {
+      loadAssets(state.selection.collection, page);
+    }
+  }
+
+  function applyFiltersAndSorting() {
+    const filter = el("filter-by-type").value;
+    const sort = el("sort-assets").value.split('_');
+    state.filterByType = filter;
+    state.sortBy = sort[0];
+    state.sortOrder = sort[1];
+    loadAssets(state.selection.collection, 1);
+  }
+
+  async function loadAssets(collection_id, page = 1) {
+    try {
+      state.page = page;
+      const offset = (page - 1) * state.limit;
+      let path = `/collections/${collection_id}/assets?offset=${offset}&limit=${state.limit}`;
+      if (state.searchQuery) {
+        path += `&query=${encodeURIComponent(state.searchQuery)}`;
+      }
+      if (state.filterByType) {
+        path += `&filter_by_type=${state.filterByType}`;
+      }
+      path += `&sort_by=${state.sortBy}&sort_order=${state.sortOrder}`;
+
+      const res = await api(path);
+      state.assets = res.assets;
+      state.total = res.total;
+
+      const filterDropdown = el("filter-by-type");
+      if (filterDropdown.options.length <= 1) { // Populate only once
+        const allFormats = [...new Set(res.all_formats || [])].sort();
+        allFormats.forEach(f => {
+          const opt = document.createElement("option");
+          opt.value = opt.textContent = f;
+          filterDropdown.appendChild(opt);
         });
       }
+
+      renderAssets();
+      renderPagination();
+      return res;
+    } catch (e) {
+      toast(`Error loading assets: ${e.message}`, 'error');
+      throw e;
     }
-    debouncedRender();
-  });
+  }
 
   // Clear assets
   function clearAssets() {
     state.assets = [];
-    state.filteredAssets = [];
     state.selection.collection = null;
     el("assets-list").innerHTML = "";
+    el("assets-pagination").innerHTML = "";
     clearPreview();
     el("asset-count").textContent = "";
   }
@@ -805,7 +836,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       state.selection.last = id;
     } else if (shift && state.selection.last) {
-      const ids = state.filteredAssets.map(a => a.id.toString());
+      const ids = state.assets.map(a => a.id.toString());
       const start = ids.indexOf(state.selection.last);
       const end = ids.indexOf(id);
       if (start !== -1 && end !== -1) {
@@ -1144,16 +1175,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   el("add-collection").onclick = () => createCollection();
 
-  const searchInput = el('search-assets');
-  let searchTimeout;
-  searchInput.addEventListener('input', () => {
-    clearTimeout(searchTimeout);
-    searchTimeout = setTimeout(() => {
-      state.searchQuery = searchInput.value;
-      state.offset = 0;
-      loadAssets(state.selection.collection);
-    }, 300);
-  });
+  el('search-assets').addEventListener('input', debounce(() => {
+    state.searchQuery = el('search-assets').value;
+    applyFiltersAndSorting();
+  }, 300));
+
+  el('filter-by-type').onchange = applyFiltersAndSorting;
+  el('sort-assets').onchange = applyFiltersAndSorting;
 
   // Init
   loadProjects();
@@ -1162,16 +1190,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const item = e.target.closest('.item');
     if (item) {
         const assetId = item.dataset.id;
-        const asset = state.filteredAssets.find(a => a.id.toString() === assetId);
+        const asset = state.assets.find(a => a.id.toString() === assetId);
         if (asset) {
             onAssetClick(asset, item, e);
         }
     }
   });
-
-  el("filter-by-type").onchange = () => {
-      applyAssetFilter();
-  };
 
   // Theme toggle
   const themeToggle = el('theme-toggle');
@@ -1468,72 +1492,66 @@ class CompactVaultManager:
             self.conn.commit()
             return current_parent_id
 
-    def _get_all_assets_for_collection(self, collection_id: int, tag: Optional[str]) -> List[Dict[str, Any]]:
-        base_sql = 'SELECT a.id, a.manifest, m.value as filename FROM assets a LEFT JOIN metadata m ON a.id = m.asset_id AND m.key = "filename" WHERE a.collection_id = ?'
-        params: List[Any] = [collection_id]
-        if tag:
-            base_sql += ' AND a.id IN (SELECT asset_id FROM metadata WHERE key = "tags" AND value LIKE ?)'
-            params.append(f'%{re.escape(tag)}%')
 
-        all_assets_cursor = self.conn.execute(base_sql, params)
-        
-        all_assets = []
-        for r in all_assets_cursor.fetchall():
-            filename = r['filename']
-            if not filename:
-                try:
-                    manifest = json.loads(r['manifest']) if r['manifest'] else {}
-                    filename = manifest.get('filename', 'Untitled')
-                except (json.JSONDecodeError, AttributeError):
-                    filename = 'Untitled'
-            all_assets.append({'id': r['id'], 'filename': filename})
-        return all_assets
-
-    def _filter_and_sort_assets(self, assets: List[Dict[str, Any]], query: Optional[str]) -> List[Dict[str, Any]]:
-        if query:
-            assets = [a for a in assets if query.lower() in a['filename'].lower()]
-        assets.sort(key=lambda x: natural_sort_key(x['filename']))
-        return assets
-
-    def _fetch_paginated_asset_details(self, asset_ids: List[int]) -> List[Dict[str, Any]]:
-        if not asset_ids:
-            return []
-
-        id_placeholders = ','.join('?' for _ in asset_ids)
-        sql = f'SELECT a.id, a.type, a.format, a.manifest, m.value as filename FROM assets a LEFT JOIN metadata m ON a.id = m.asset_id AND m.key = "filename" WHERE a.id IN ({id_placeholders})'
-        
-        cur = self.conn.execute(sql, asset_ids)
-        asset_details_map = {r['id']: dict(r) for r in cur.fetchall()}
-
-        results = []
-        for asset_id in asset_ids:
-            row = asset_details_map.get(asset_id)
-            if not row: continue
-
-            manifest = json.loads(row['manifest']) if row['manifest'] else {}
-            if not row['filename']:
-                row['filename'] = manifest.get('filename', 'Untitled')
-            row['size_original'] = manifest.get('total_size', 0)
-            del row['manifest']
-            results.append(row)
-        return results
-
-    def get_assets_for_collection(self, collection_id: int, offset: int = 0, limit: int = 50, tag: Optional[str] = None, query: Optional[str] = None) -> Dict[str, Any]:
+    def get_assets_for_collection(self, collection_id: int, offset: int = 0, limit: int = 50, tag: Optional[str] = None, query: Optional[str] = None, filter_by_type: Optional[str] = None, sort_by: str = 'filename', sort_order: str = 'asc') -> Dict[str, Any]:
         with self.lock:
             try:
-                all_assets = self._get_all_assets_for_collection(collection_id, tag)
-                sorted_assets = self._filter_and_sort_assets(all_assets, query)
-                
-                total = len(sorted_assets)
-                paginated_ids = [a['id'] for a in sorted_assets[offset:offset + limit]]
-                
-                paginated_assets = self._fetch_paginated_asset_details(paginated_ids)
+                where_clauses = ['a.collection_id = ?']
+                params: List[Any] = [collection_id]
 
-                return {'assets': paginated_assets, 'total': total}
+                if query:
+                    where_clauses.append("a.id IN (SELECT asset_id FROM metadata WHERE key = 'filename' AND LOWER(value) LIKE LOWER(?))")
+                    params.append(f'%{query}%')
+                
+                if filter_by_type:
+                    where_clauses.append('a.format = ?')
+                    params.append(filter_by_type)
+
+                if tag:
+                    where_clauses.append('a.id IN (SELECT asset_id FROM metadata WHERE key = "tags" AND value LIKE ?)')
+                    params.append(f'%{re.escape(tag)}%')
+
+                where_sql = ' AND '.join(where_clauses)
+
+                # Get total count
+                count_sql = f"SELECT COUNT(a.id) FROM assets a WHERE {where_sql}"
+                total = self.conn.execute(count_sql, params).fetchone()[0]
+
+                # Add sorting
+                if sort_by == 'size':
+                    order_clause = 'json_extract(a.manifest, \'$.total_size\')'
+                else: # Default to filename
+                    order_clause = '(SELECT value FROM metadata WHERE asset_id = a.id AND key = "filename")'
+                
+                sort_direction = 'DESC' if sort_order.lower() == 'desc' else 'ASC'
+                order_by_sql = f'ORDER BY {order_clause} {sort_direction}'
+
+                # Fetch paginated assets
+                base_sql = f'SELECT a.id, a.type, a.format, a.manifest, (SELECT value FROM metadata WHERE asset_id = a.id AND key = "filename") as filename FROM assets a WHERE {where_sql} {order_by_sql} LIMIT ? OFFSET ?'
+                
+                paginated_params = params + [limit, offset]
+                cur = self.conn.execute(base_sql, paginated_params)
+                
+                paginated_assets = []
+                for row in cur.fetchall():
+                    r = dict(row)
+                    manifest = json.loads(r['manifest']) if r['manifest'] else {}
+                    if not r['filename']:
+                        r['filename'] = manifest.get('filename', 'Untitled')
+                    r['size_original'] = manifest.get('total_size', 0)
+                    del r['manifest']
+                    paginated_assets.append(r)
+
+                # Get all formats for the filter dropdown
+                all_formats_sql = 'SELECT DISTINCT format FROM assets WHERE collection_id = ?'
+                all_formats_cur = self.conn.execute(all_formats_sql, [collection_id])
+                all_formats = [row[0] for row in all_formats_cur.fetchall() if row[0]]
+
+                return {'assets': paginated_assets, 'total': total, 'all_formats': all_formats}
 
             except (sqlite3.Error, json.JSONDecodeError) as e:
                 logging.error(f"Get assets error: {e}")
-                return {'assets': [], 'total': 0}
+                return {'assets': [], 'total': 0, 'all_formats': []}
 
     def get_asset_metadata(self, asset_id: int) -> Optional[Dict[str, Any]]:
         """Gets asset metadata without loading data."""
@@ -2064,7 +2082,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             limit = int(qs.get('limit', [50])[0])
             tag = qs.get('tag', [None])[0]
             query = qs.get('query', [None])[0]
-            self._send_json(self.server.app_state["manager"].get_assets_for_collection(collection_id, offset, limit, tag, query))
+            filter_by_type = qs.get('filter_by_type', [None])[0]
+            sort_by = qs.get('sort_by', ['filename'])[0]
+            sort_order = qs.get('sort_order', ['asc'])[0]
+            self._send_json(self.server.app_state["manager"].get_assets_for_collection(collection_id, offset, limit, tag, query, filter_by_type, sort_by, sort_order))
         except ValueError:
             self._send_json({'message': 'Invalid collection ID'}, 400)
 
