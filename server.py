@@ -1860,23 +1860,49 @@ class CompactVaultManager:
                 filename = manifest.get('filename', f'asset_{asset_id}')
                 size = manifest.get('total_size', 0)
 
+                # === OPTIMIZATION START ===
                 if row['type'] == 'text':
+                    MAX_PREVIEW_SIZE = 32 * 1024  # Limit preview to 32KB
                     data = bytearray()
+                    is_truncated = False
+                    
                     for block in manifest['chain']:
+                        # Stop if we have enough data for a preview
+                        if len(data) >= MAX_PREVIEW_SIZE:
+                            is_truncated = True
+                            break
+                            
                         chunk_hash = block['chunk_hash']
                         chunk_row = self.conn.execute("SELECT data FROM chunks WHERE hash=?", (chunk_hash,)).fetchone()
-                        if chunk_row: data.extend(zlib.decompress(chunk_row['data']))
+                        if chunk_row: 
+                            decompressed = zlib.decompress(chunk_row['data'])
+                            data.extend(decompressed)
+                    
+                    # Trim to exact limit if we went over
+                    if len(data) > MAX_PREVIEW_SIZE:
+                        data = data[:MAX_PREVIEW_SIZE]
+                        is_truncated = True
+
                     text = data.decode('utf-8', errors='ignore')
-                    if row['format'] == 'json':
+                    
+                    if is_truncated:
+                        text += "\n\n... [PREVIEW TRUNCATED AT 32KB] ... Download to view full file."
+
+                    # Basic formatting for code files
+                    if row['format'] == 'json' and not is_truncated:
                         try: text = json.dumps(json.loads(text), indent=2)
                         except: pass
-                    elif row['format'] == 'xml':
-                        try:
-                            tree = ET.fromstring(text)
-                            ET.indent(tree, space='  ')
-                            text = ET.tostring(tree, encoding='unicode', method='xml')
-                        except: pass
-                    return {'id':asset_id, 'type':'text', 'format':row['format'], 'filename':filename, 'size_original':size, 'content':text}
+                    
+                    return {
+                        'id': asset_id, 
+                        'type': 'text', 
+                        'format': row['format'], 
+                        'filename': filename, 
+                        'size_original': size, 
+                        'content': text
+                    }
+                # === OPTIMIZATION END ===
+                
                 else:
                     return {'id':asset_id, 'type':row['type'], 'format':row['format'], 'filename':filename, 'size_original':size}
             except sqlite3.Error as e:
