@@ -172,7 +172,7 @@ HTML_TEMPLATE = '''
   </main>
 
   <div id="toast" class="toast hidden" role="alert"></div>
-  <input id="file-input" type="file" multiple webkitdirectory style="display:none" />
+  <input id="file-input" type="file" multiple style="display:none" accept=".png,.jpg,.jpeg,.gif,.svg,.webp,.mp3,.wav,.ogg,.m4a,.flac,.mp4,.mov,.webm,.mkv,.avi,.flv,.gltf,.glb,.epub,.pdf,.zip,.rar,.7z" />
   <div id="progress-container" class="progress-container hidden">
     <p>Uploading...</p>
     <div class="progress-bar">
@@ -521,11 +521,13 @@ body.light {
   justify-content: center;
   flex-grow: 1;
   word-break: break-word;
+  min-width: 0;
 }
 .item-name {
   font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .item-details {
   font-size: 12px;
