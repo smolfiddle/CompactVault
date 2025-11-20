@@ -172,7 +172,7 @@ HTML_TEMPLATE = '''
   </main>
 
   <div id="toast" class="toast hidden" role="alert"></div>
-  <input id="file-input" type="file" multiple style="display:none" />
+  <input id="file-input" type="file" multiple webkitdirectory style="display:none" />
   <div id="progress-container" class="progress-container hidden">
     <p>Uploading...</p>
     <div class="progress-bar">
@@ -1100,6 +1100,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const filesToUpload = [];
 
     async function getFilesFromEntry(entry, path = '') {
+      if (!entry) {
+        return [];
+      }
+      if (!entry) {
+        return [];
+      }
       if (entry.isFile) {
         return new Promise(resolve => {
           entry.file(f => resolve([{ file: f, path: path }]));
@@ -1123,7 +1129,9 @@ document.addEventListener('DOMContentLoaded', () => {
       if (item.webkitGetAsEntry) {
         droppedItems.push(item.webkitGetAsEntry());
       } else if (item instanceof File) {
-        filesToUpload.push({ file: item, path: '' });
+        // For files from an input or individual dropped files, use webkitRelativePath if available
+        const path = item.webkitRelativePath ? item.webkitRelativePath.substring(0, item.webkitRelativePath.lastIndexOf('/') + 1) : '';
+        filesToUpload.push({ file: item, path: path });
       }
     }
 
@@ -1187,7 +1195,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Event listeners
-  el("file-input").onchange = ev => uploadFiles(ev.target.files);
+  el("file-input").onchange = ev => uploadFiles(Array.from(ev.target.files));
 
   el("upload-files").onclick = () => {
     if (!state.selection.collection) {
@@ -1495,7 +1503,6 @@ class CompactVaultManager:
                 logging.error(f"Error in asset creation worker: {e}")
 
     def create_asset_from_chunks(self, collection_id: int, chunk_paths: List[str], filename: str) -> int:
-        stitched_file_path = None
         try:
             file_extension = filename.split('.')[-1].lower() if '.' in filename else 'binary'
             asset_type_map = {
@@ -1510,17 +1517,12 @@ class CompactVaultManager:
 
             manifest: Dict[str, Any] = {'chain': [], 'total_size': 0, 'filename': filename}
             previous_block_hash: Optional[str] = None
-            
-            # Create a temporary file to stitch chunks together
-            with tempfile.NamedTemporaryFile(dir=UPLOAD_TEMP_DIR, delete=False) as stitched_file:
-                stitched_file_path = stitched_file.name
-                for chunk_path in chunk_paths:
-                    with open(chunk_path, 'rb') as chunk_f:
-                        shutil.copyfileobj(chunk_f, stitched_file)
 
-            # Process the stitched file with the dynamic chunker
-            with open(stitched_file_path, 'rb') as f:
-                for chunk_data in dynamic_chunker(f):
+            for chunk_path in chunk_paths:
+                try:
+                    with open(chunk_path, 'rb') as f:
+                        chunk_data = f.read()
+
                     chunk_size = len(chunk_data)
                     chunk_hash = hashlib.blake2b(chunk_data).hexdigest()
                     compressed = zlib.compress(chunk_data, level=9)
@@ -1540,7 +1542,11 @@ class CompactVaultManager:
                     manifest['chain'].append(block)
                     manifest['total_size'] += chunk_size
                     previous_block_hash = block_hash
-            
+
+                except Exception as e:
+                    logging.error(f"Error processing chunk {chunk_path}: {e}")
+                    raise
+
             manifest_str = json.dumps(manifest)
             logging.info(f"Created manifest for {filename}")
 
@@ -1554,29 +1560,25 @@ class CompactVaultManager:
                 self.conn.execute("INSERT INTO metadata (asset_id, key, value) VALUES (?, 'filename', ?)", (asset_id, filename))
                 self.conn.commit()
                 logging.info(f"Successfully inserted asset {asset_id} for {filename}")
-            
+
+            # Clean up
+            for path in chunk_paths:
+                try: os.remove(path)
+                except OSError: pass
+            try: os.rmdir(os.path.dirname(chunk_paths[0]))
+            except (OSError, IndexError): pass
+
             return asset_id
 
         except Exception as e:
             logging.error(f"Unexpected error during asset creation: {e}")
-            raise
-        finally:
-            # Robust cleanup
-            if stitched_file_path and os.path.exists(stitched_file_path):
-                os.remove(stitched_file_path)
-            
-            upload_dir = None
+            # Ensure cleanup happens on error too
             for path in chunk_paths:
-                try: 
-                    if not upload_dir:
-                        upload_dir = os.path.dirname(path)
-                    os.remove(path)
+                try: os.remove(path)
                 except OSError: pass
-            
-            if upload_dir and os.path.exists(upload_dir) and not os.listdir(upload_dir):
-                try:
-                    os.rmdir(upload_dir)
-                except OSError: pass
+            try: os.rmdir(os.path.dirname(chunk_paths[0]))
+            except (OSError, IndexError): pass
+            raise
 
     def get_or_create_collection_from_path(self, base_collection_id: int, path_prefix: str) -> int:
         with self.lock:
