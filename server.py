@@ -1505,6 +1505,7 @@ class CompactVaultManager:
                 logging.error(f"Error in asset creation worker: {e}")
 
     def create_asset_from_chunks(self, collection_id: int, chunk_paths: List[str], filename: str) -> int:
+        full_temp_path = None
         try:
             file_extension = filename.split('.')[-1].lower() if '.' in filename else 'binary'
             asset_type_map = {
@@ -1520,35 +1521,38 @@ class CompactVaultManager:
             manifest: Dict[str, Any] = {'chain': [], 'total_size': 0, 'filename': filename}
             previous_block_hash: Optional[str] = None
 
-            for chunk_path in chunk_paths:
-                try:
-                    with open(chunk_path, 'rb') as f:
-                        chunk_data = f.read()
+            if chunk_paths:
+                # 1. Create a single temporary file by concatenating the received chunks
+                temp_dir = os.path.dirname(chunk_paths[0])
+                with tempfile.NamedTemporaryFile(dir=temp_dir, delete=False) as outfile:
+                    full_temp_path = outfile.name
+                    for p in chunk_paths: # chunk_paths is already sorted by api_complete_upload
+                        with open(p, 'rb') as infile:
+                            shutil.copyfileobj(infile, outfile)
 
-                    chunk_size = len(chunk_data)
-                    chunk_hash = hashlib.blake2b(chunk_data).hexdigest()
-                    compressed = zlib.compress(chunk_data, level=9)
+                # 2. Run Content-Defined Chunking on the complete file
+                with open(full_temp_path, 'rb') as stream:
+                    for chunk_data in dynamic_chunker(stream):
+                        chunk_size = len(chunk_data)
+                        chunk_hash = hashlib.blake2b(chunk_data).hexdigest()
+                        compressed = zlib.compress(chunk_data, level=9)
 
-                    with self.lock:
-                        self.conn.execute("INSERT OR IGNORE INTO chunks (hash, data) VALUES (?, ?)", (chunk_hash, compressed))
-                        self.conn.commit()
+                        with self.lock:
+                            self.conn.execute("INSERT OR IGNORE INTO chunks (hash, data) VALUES (?, ?)", (chunk_hash, compressed))
+                            self.conn.commit()
 
-                    block = {
-                        'chunk_hash': chunk_hash,
-                        'size': chunk_size,
-                        'previous_hash': previous_block_hash
-                    }
-                    block_str = json.dumps(block, sort_keys=True)
-                    block_hash = hashlib.blake2b(block_str.encode()).hexdigest()
+                        block = {
+                            'chunk_hash': chunk_hash,
+                            'size': chunk_size,
+                            'previous_hash': previous_block_hash
+                        }
+                        block_str = json.dumps(block, sort_keys=True)
+                        block_hash = hashlib.blake2b(block_str.encode()).hexdigest()
 
-                    manifest['chain'].append(block)
-                    manifest['total_size'] += chunk_size
-                    previous_block_hash = block_hash
-
-                except Exception as e:
-                    logging.error(f"Error processing chunk {chunk_path}: {e}")
-                    raise
-
+                        manifest['chain'].append(block)
+                        manifest['total_size'] += chunk_size
+                        previous_block_hash = block_hash
+            
             manifest_str = json.dumps(manifest)
             logging.info(f"Created manifest for {filename}")
 
@@ -1563,24 +1567,27 @@ class CompactVaultManager:
                 self.conn.commit()
                 logging.info(f"Successfully inserted asset {asset_id} for {filename}")
 
-            # Clean up
-            for path in chunk_paths:
-                try: os.remove(path)
-                except OSError: pass
-            try: os.rmdir(os.path.dirname(chunk_paths[0]))
-            except (OSError, IndexError): pass
-
             return asset_id
 
         except Exception as e:
             logging.error(f"Unexpected error during asset creation: {e}")
-            # Ensure cleanup happens on error too
-            for path in chunk_paths:
-                try: os.remove(path)
-                except OSError: pass
-            try: os.rmdir(os.path.dirname(chunk_paths[0]))
-            except (OSError, IndexError): pass
             raise
+        finally:
+            # Clean up all temporary files
+            if full_temp_path and os.path.exists(full_temp_path):
+                os.remove(full_temp_path)
+            
+            if chunk_paths:
+                # Clean up original chunks and their directory
+                for path in chunk_paths:
+                    try: 
+                        os.remove(path)
+                    except OSError: 
+                        pass
+                try: 
+                    os.rmdir(os.path.dirname(chunk_paths[0]))
+                except (OSError, IndexError): 
+                    pass
 
     def get_or_create_collection_from_path(self, base_collection_id: int, path_prefix: str) -> int:
         with self.lock:
