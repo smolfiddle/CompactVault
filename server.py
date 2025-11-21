@@ -208,7 +208,8 @@ HTML_TEMPLATE = '''
   <div id="toast" class="toast hidden" role="alert"></div>
   <input id="file-input" type="file" multiple style="display:none" accept=".png,.jpg,.jpeg,.gif,.svg,.webp,.mp3,.wav,.ogg,.m4a,.flac,.mp4,.mov,.webm,.mkv,.avi,.flv,.gltf,.glb,.epub,.pdf,.zip,.rar,.7z" />
   <div id="progress-container" class="progress-container hidden">
-    <p>Uploading...</p>
+    <p id="progress-title">Uploading...</p>
+    <small id="progress-subtitle"></small>
     <div class="progress-bar">
       <div id="progress-bar-inner" class="progress-bar-inner"></div>
     </div>
@@ -601,6 +602,17 @@ body.light {
   opacity: 0.5;
   cursor: not-allowed;
 }
+.progress-subtitle {
+  font-size: 12px;
+  opacity: 0.8;
+  margin-top: 4px;
+  display: block;
+}
+@keyframes pulse {
+  0% { background-color: var(--accent); }
+  50% { background-color: #007acc; }
+  100% { background-color: var(--accent); }
+}
 '''
 
 # Revamped JavaScript with better structure, error handling, and features
@@ -608,18 +620,33 @@ JAVASCRIPT_CODE = r'''
 document.addEventListener('DOMContentLoaded', () => {
 
   const Progress = {
-    show(msg) {
+    show(msg, subtitle = '') {
       const container = el('progress-container');
-      if (container) {
-        container.querySelector('p').textContent = msg;
+      const titleEl = el('progress-title');
+      const subtitleEl = el('progress-subtitle');
+      if (container && titleEl && subtitleEl) {
+        titleEl.textContent = msg;
+        subtitleEl.textContent = subtitle;
         container.classList.remove('hidden');
       }
     },
     update(val) {
       const bar = el('progress-bar-inner');
       if (bar) {
+        bar.style.animation = '';
         bar.style.width = `${val}%`;
       }
+    },
+    setIndeterminate(is_indeterminate) {
+        const bar = el('progress-bar-inner');
+        if (bar) {
+            if (is_indeterminate) {
+                bar.style.width = '100%';
+                bar.style.animation = 'pulse 2s infinite ease-in-out';
+            } else {
+                bar.style.animation = '';
+            }
+        }
     },
     hide() {
       const container = el('progress-container');
@@ -1139,9 +1166,6 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!entry) {
         return [];
       }
-      if (!entry) {
-        return [];
-      }
       if (entry.isFile) {
         return new Promise(resolve => {
           entry.file(f => resolve([{ file: f, path: path }]));
@@ -1177,11 +1201,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (filesToUpload.length === 0) return;
 
+    toast('Starting upload... Please do not refresh while chunks are uploading.', 'warning');
+
     try {
       let total_size = filesToUpload.reduce((acc, f) => acc + f.file.size, 0);
       let uploaded_size = 0;
 
       Progress.show(`Uploading ${filesToUpload.length} files...`);
+      Progress.setIndeterminate(false);
       Progress.update(0);
 
       const update_progress = (chunk_size) => {
@@ -1203,31 +1230,48 @@ document.addEventListener('DOMContentLoaded', () => {
 
     } catch (e) {
       toast(e.message, 'error');
-    } finally {
       Progress.hide();
-      toast('Uploads accepted, processing in background...', 'info');
-
-      // Poll for changes
-      let attempts = 0;
-      const maxAttempts = 60;
-      const interval = 2000; // 2 seconds
-
-      const poll = setInterval(async () => {
-        attempts++;
-        try {
-            if (!state.selection.collection) {
-                clearInterval(poll);
-                return;
-            }
-            const newAssets = await loadAssets(state.selection.collection);
-            if (newAssets.assets.length > state.assets.length || attempts > maxAttempts) {
-                clearInterval(poll);
-            }
-        } catch (e) {
-            clearInterval(poll);
-        }
-      }, interval);
+      return;
     }
+
+    // Repurpose progress container for the manifest step
+    Progress.show('Processing & Manifesting...', 'This may take a minute for large files. The UI is now responsive.');
+    Progress.setIndeterminate(true);
+    toast('Upload complete! Now processing file...', 'success');
+
+    // Poll for changes
+    let attempts = 0;
+    const maxAttempts = 60;
+    const pollInterval = 5000; // 5 seconds
+    const initialTotal = state.total; // Capture the total before polling starts
+
+    const poll = setInterval(async () => {
+      attempts++;
+      try {
+          if (!state.selection.collection) {
+              clearInterval(poll);
+              Progress.hide();
+              return;
+          }
+          // The loadAssets call will update the view and the state.total.
+          // We check page 1 for simplicity to see if any new asset has been added.
+          const newAssets = await loadAssets(state.selection.collection, 1); 
+
+          // Compare the new total from the server with the total we had when we started.
+          if (newAssets.total > initialTotal || attempts > maxAttempts) {
+              clearInterval(poll);
+              Progress.hide();
+              // A full refresh of assets for the user's current page to ensure the view is correct,
+              // especially if they were not on page 1.
+              if (state.page !== 1) {
+                  loadAssets(state.selection.collection, state.page);
+              }
+          }
+      } catch (e) {
+          clearInterval(poll);
+          Progress.hide();
+      }
+    }, pollInterval);
   }
 
   // Event listeners
@@ -1359,6 +1403,45 @@ DEFAULT_DB = "default.vault"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+class ChainedFileWrapper(io.RawIOBase):
+    def __init__(self, paths):
+        self.paths = paths
+        self.current_idx = 0
+        self.current_f = None
+        self._open_next()
+
+    def _open_next(self):
+        if self.current_f:
+            self.current_f.close()
+        if self.current_idx < len(self.paths):
+            self.current_f = open(self.paths[self.current_idx], 'rb')
+            self.current_idx += 1
+        else:
+            self.current_f = None
+
+    def readinto(self, b):
+        if not self.current_f:
+            return 0
+        
+        data = self.current_f.read(len(b))
+        if not data:
+            self._open_next()
+            if not self.current_f:
+                return 0
+            return self.readinto(b)
+        
+        n = len(data)
+        b[:n] = data
+        return n
+    
+    def close(self):
+        if self.current_f:
+            self.current_f.close()
+        super().close()
+        
+    def readable(self):
+        return True
+
 # region CompactVaultManager
 
 def natural_sort_key(s):
@@ -1388,13 +1471,20 @@ class CompactVaultManager:
         self._ensure_schema_extensions()
 
         # Asset creation queue and worker
-        self.asset_creation_queue: queue.Queue[Optional[Tuple[int, List[str], str]]] = queue.Queue()
+        self.asset_creation_queue: queue.Queue[Optional[Tuple[int, str, List[str], str]]] = queue.Queue()
         num_workers = os.cpu_count() or 4
         self.workers: List[threading.Thread] = []
         for _ in range(num_workers):
             t = threading.Thread(target=self._process_asset_creation_queue, daemon=True)
             t.start()
             self.workers.append(t)
+
+    def _get_read_conn(self) -> sqlite3.Connection:
+        """Creates a new, short-lived, read-only database connection."""
+        db_uri = f"file:{self.db_path}?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     def create_database_schema(self) -> None:
         queries = [
@@ -1455,9 +1545,9 @@ class CompactVaultManager:
 
     def check_password(self, password: str) -> bool:
         """Checks if the provided password is correct."""
-        with self.lock:
-            try:
-                cur = self.conn.cursor()
+        try:
+            with self._get_read_conn() as conn:
+                cur = conn.cursor()
                 cur.execute("SELECT value FROM vault_properties WHERE key = 'password_salt'")
                 salt_row = cur.fetchone()
                 cur.execute("SELECT value FROM vault_properties WHERE key = 'password_hash'")
@@ -1473,9 +1563,9 @@ class CompactVaultManager:
                 new_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
                 
                 return new_hash == stored_hash
-            except (sqlite3.Error, ValueError) as e:
-                logging.error(f"Password check error: {e}")
-                return False
+        except (sqlite3.Error, ValueError) as e:
+            logging.error(f"Password check error: {e}")
+            return False
 
     def _migrate_to_chunked_storage(self, cursor: sqlite3.Cursor) -> None:
         with self.lock:
@@ -1533,13 +1623,12 @@ class CompactVaultManager:
                 task = self.asset_creation_queue.get()
                 if task is None:
                     break  # Sentinel value to stop the worker
-                collection_id, chunk_paths, filename = task
-                self.create_asset_from_chunks(collection_id, chunk_paths, filename)
+                base_collection_id, path_prefix, chunk_paths, filename = task
+                self.create_asset_from_chunks(base_collection_id, path_prefix, chunk_paths, filename)
             except Exception as e:
                 logging.error(f"Error in asset creation worker: {e}")
 
-    def create_asset_from_chunks(self, collection_id: int, chunk_paths: List[str], filename: str) -> int:
-        full_temp_path = None
+    def create_asset_from_chunks(self, base_collection_id: int, path_prefix: str, chunk_paths: List[str], filename: str) -> int:
         try:
             file_extension = filename.split('.')[-1].lower() if '.' in filename else 'binary'
             asset_type_map = {
@@ -1554,29 +1643,46 @@ class CompactVaultManager:
 
             manifest: Dict[str, Any] = {'chain': [], 'total_size': 0, 'filename': filename}
             previous_block_hash: Optional[str] = None
-
+            
+            # Optimization: Estimate params based on first chunk header
+            header = b''
             if chunk_paths:
-                # 1. Create a single temporary file by concatenating the received chunks
-                temp_dir = os.path.dirname(chunk_paths[0])
-                with tempfile.NamedTemporaryFile(dir=temp_dir, delete=False) as outfile:
-                    full_temp_path = outfile.name
-                    for p in chunk_paths: # chunk_paths is already sorted by api_complete_upload
-                        with open(p, 'rb') as infile:
-                            shutil.copyfileobj(infile, outfile)
+                with open(chunk_paths[0], 'rb') as f:
+                    header = f.read(1024)
+            
+            # Simple heuristic for chunking parameters without reading whole file size
+            # Assuming if there are many chunks, it's a big file
+            if len(chunk_paths) > 2: 
+                min_sz, max_sz = 65536, 1048576 # 1MB chunks
+            else:
+                min_sz, max_sz = 4096, 262144
+            
+            sentinel = b'\x42\xFE'
+            if all(b < 128 for b in header[:100]):
+                sentinel = b'\xFF\xFE'
 
-                # 2. Run Content-Defined Chunking on the complete file
-                min_sz, max_sz, sentinel = OptimizedCDC.get_optimal_params(full_temp_path)
-                cdc = OptimizedCDC(min_size=min_sz, max_size=max_sz, sentinel=sentinel)
+            cdc = OptimizedCDC(min_size=min_sz, max_size=max_sz, sentinel=sentinel)
+            
+            # Use wrapped stream instead of concatenating to a huge temp file
+            stream = ChainedFileWrapper(chunk_paths)
+            
+            # OPTIMIZATION: Start transaction
+            with self.lock:
+                self.conn.execute("BEGIN TRANSACTION")
                 
-                with open(full_temp_path, 'rb') as stream:
+                try:
+                    # ATOMIC FIX: Resolve path inside the transaction
+                    collection_id = self.get_or_create_collection_from_path(base_collection_id, path_prefix)
+
                     for chunk_data in cdc.chunk_file(stream):
                         chunk_size = len(chunk_data)
                         chunk_hash = hashlib.blake2b(chunk_data).hexdigest()
-                        compressed = zlib.compress(chunk_data, level=9)
+                        
+                        # OPTIMIZATION: Lower compression level for speed (1=Fastest, 9=Best)
+                        compressed = zlib.compress(chunk_data, level=1)
 
-                        with self.lock:
-                            self.conn.execute("INSERT OR IGNORE INTO chunks (hash, data) VALUES (?, ?)", (chunk_hash, compressed))
-                            self.conn.commit()
+                        # Insert chunk data
+                        self.conn.execute("INSERT OR IGNORE INTO chunks (hash, data) VALUES (?, ?)", (chunk_hash, compressed))
 
                         block = {
                             'chunk_hash': chunk_hash,
@@ -1589,20 +1695,26 @@ class CompactVaultManager:
                         manifest['chain'].append(block)
                         manifest['total_size'] += chunk_size
                         previous_block_hash = block_hash
-            
-            manifest_str = json.dumps(manifest)
-            logging.info(f"Created manifest for {filename}")
+                    
+                    manifest_str = json.dumps(manifest)
+                    logging.info(f"Created manifest for {filename}")
 
-            with self.lock:
-                cur = self.conn.cursor()
-                sql = 'INSERT INTO assets (collection_id, type, format, manifest) VALUES (?, ?, ?, ?)'
-                params = (collection_id, asset_type, file_extension, manifest_str)
-                cur.execute(sql, params)
-                asset_id = cur.lastrowid
+                    sql = 'INSERT INTO assets (collection_id, type, format, manifest) VALUES (?, ?, ?, ?)'
+                    params = (collection_id, asset_type, file_extension, manifest_str)
+                    cur = self.conn.execute(sql, params)
+                    asset_id = cur.lastrowid
 
-                self.conn.execute("INSERT INTO metadata (asset_id, key, value) VALUES (?, 'filename', ?)", (asset_id, filename))
-                self.conn.commit()
-                logging.info(f"Successfully inserted asset {asset_id} for {filename}")
+                    self.conn.execute("INSERT INTO metadata (asset_id, key, value) VALUES (?, 'filename', ?)", (asset_id, filename))
+                    
+                    # Commit everything at once
+                    self.conn.commit()
+                    logging.info(f"Successfully inserted asset {asset_id} for {filename}")
+                    
+                except Exception:
+                    self.conn.rollback()
+                    raise
+                finally:
+                    stream.close()
 
             return asset_id
 
@@ -1610,21 +1722,13 @@ class CompactVaultManager:
             logging.error(f"Unexpected error during asset creation: {e}")
             raise
         finally:
-            # Clean up all temporary files
-            if full_temp_path and os.path.exists(full_temp_path):
-                os.remove(full_temp_path)
-            
+            # Clean up chunks
             if chunk_paths:
-                # Clean up original chunks and their directory
                 for path in chunk_paths:
-                    try: 
-                        os.remove(path)
-                    except OSError: 
-                        pass
-                try: 
-                    os.rmdir(os.path.dirname(chunk_paths[0]))
-                except (OSError, IndexError): 
-                    pass
+                    try: os.remove(path)
+                    except OSError: pass
+                try: os.rmdir(os.path.dirname(chunk_paths[0]))
+                except (OSError, IndexError): pass
 
     def get_or_create_collection_from_path(self, base_collection_id: int, path_prefix: str) -> int:
         with self.lock:
@@ -1650,13 +1754,12 @@ class CompactVaultManager:
                     cur.execute("INSERT INTO collections (project_id, name, type, parent_id) VALUES (?, ?, ?, ?)", (project_id, part, 'collection', current_parent_id))
                     current_parent_id = cur.lastrowid
 
-            self.conn.commit()
             return current_parent_id
 
 
     def get_assets_for_collection(self, collection_id: int, offset: int = 0, limit: int = 50, tag: Optional[str] = None, query: Optional[str] = None, filter_by_type: Optional[str] = None, sort_by: str = 'filename', sort_order: str = 'asc') -> Dict[str, Any]:
-        with self.lock:
-            try:
+        try:
+            with self._get_read_conn() as conn:
                 where_clauses = ['a.collection_id = ?']
                 params: List[Any] = [collection_id]
 
@@ -1676,7 +1779,7 @@ class CompactVaultManager:
 
                 # Get total count
                 count_sql = f"SELECT COUNT(a.id) FROM assets a WHERE {where_sql}"
-                total = self.conn.execute(count_sql, params).fetchone()[0]
+                total = conn.execute(count_sql, params).fetchone()[0]
 
                 # Add sorting
                 if sort_by == 'size':
@@ -1691,7 +1794,7 @@ class CompactVaultManager:
                 base_sql = f'SELECT a.id, a.type, a.format, a.manifest, (SELECT value FROM metadata WHERE asset_id = a.id AND key = "filename") as filename FROM assets a WHERE {where_sql} {order_by_sql} LIMIT ? OFFSET ?'
                 
                 paginated_params = params + [limit, offset]
-                cur = self.conn.execute(base_sql, paginated_params)
+                cur = conn.execute(base_sql, paginated_params)
                 
                 paginated_assets = []
                 for row in cur.fetchall():
@@ -1705,34 +1808,43 @@ class CompactVaultManager:
 
                 # Get all formats for the filter dropdown
                 all_formats_sql = 'SELECT DISTINCT format FROM assets WHERE collection_id = ?'
-                all_formats_cur = self.conn.execute(all_formats_sql, [collection_id])
+                all_formats_cur = conn.execute(all_formats_sql, [collection_id])
                 all_formats = [row[0] for row in all_formats_cur.fetchall() if row[0]]
 
                 return {'assets': paginated_assets, 'total': total, 'all_formats': all_formats}
 
-            except (sqlite3.Error, json.JSONDecodeError) as e:
-                logging.error(f"Get assets error: {e}")
-                return {'assets': [], 'total': 0, 'all_formats': []}
+        except (sqlite3.Error, json.JSONDecodeError) as e:
+            logging.error(f"Get assets error: {e}")
+            return {'assets': [], 'total': 0, 'all_formats': []}
 
     def get_asset_metadata(self, asset_id: int) -> Optional[Dict[str, Any]]:
         """Gets asset metadata without loading data."""
-        with self.lock:
-            row = self.conn.execute("SELECT manifest FROM assets WHERE id=?", (asset_id,)).fetchone()
-            if not row or not row['manifest']: return None
-            manifest = json.loads(row['manifest'])
-            filename = manifest.get('filename', f'asset_{asset_id}')
-            mime = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-            size = manifest.get('total_size', 0)
-            return {'filename': filename, 'mime': mime, 'size': size, 'manifest_str': row['manifest']}
+        try:
+            with self._get_read_conn() as conn:
+                row = conn.execute("SELECT manifest FROM assets WHERE id=?", (asset_id,)).fetchone()
+                if not row or not row['manifest']: return None
+                manifest = json.loads(row['manifest'])
+                filename = manifest.get('filename', f'asset_{asset_id}')
+                mime = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+                size = manifest.get('total_size', 0)
+                return {'filename': filename, 'mime': mime, 'size': size, 'manifest_str': row['manifest']}
+        except (sqlite3.Error, json.JSONDecodeError) as e:
+            logging.error(f"Get asset metadata error: {e}")
+            return None
 
     def get_manifest(self, asset_id: int) -> Optional[Dict[str, Any]]:
-        with self.lock:
-            row = self.conn.execute("SELECT manifest FROM assets WHERE id=?", (asset_id,)).fetchone()
-            if not row or not row['manifest']:
-                return None
-            return json.loads(row['manifest'])
+        try:
+            with self._get_read_conn() as conn:
+                row = conn.execute("SELECT manifest FROM assets WHERE id=?", (asset_id,)).fetchone()
+                if not row or not row['manifest']:
+                    return None
+                return json.loads(row['manifest'])
+        except (sqlite3.Error, json.JSONDecodeError) as e:
+            logging.error(f"Get manifest error: {e}")
+            return None
 
     def stream_asset_range(self, asset_id: int, start_byte: int, end_byte: int) -> Iterator[bytes]:
+        # get_manifest is already refactored and uses a read connection
         manifest = self.get_manifest(asset_id)
         if not manifest:
             return
@@ -1743,82 +1855,96 @@ class CompactVaultManager:
 
         current_pos = 0
 
-        for block in manifest['chain']:
-            chunk_hash = block['chunk_hash']
-            chunk_size = block['size']
+        # This method is a generator, so we must manage the connection lifecycle carefully.
+        # We can't use a 'with' statement that would close the connection after the first yield.
+        conn = self._get_read_conn()
+        try:
+            for block in manifest['chain']:
+                chunk_hash = block['chunk_hash']
+                chunk_size = block['size']
 
-            chunk_start = current_pos
-            chunk_end = current_pos + chunk_size - 1
+                chunk_start = current_pos
+                chunk_end = current_pos + chunk_size - 1
 
-            if chunk_end >= start_byte:
-                with self.lock:
-                    chunk_row = self.conn.execute("SELECT data FROM chunks WHERE hash=?", (chunk_hash,)).fetchone()
+                if chunk_end >= start_byte:
+                    # No lock needed for reads
+                    chunk_row = conn.execute("SELECT data FROM chunks WHERE hash=?", (chunk_hash,)).fetchone()
 
-                if chunk_row and chunk_row['data']:
-                    try:
-                        data = zlib.decompress(chunk_row['data'])
+                    if chunk_row and chunk_row['data']:
+                        try:
+                            data = zlib.decompress(chunk_row['data'])
 
-                        slice_start = max(0, start_byte - chunk_start)
-                        slice_end = min(chunk_size, end_byte - chunk_start + 1)
+                            slice_start = max(0, start_byte - chunk_start)
+                            slice_end = min(chunk_size, end_byte - chunk_start + 1)
 
-                        if slice_start < slice_end:
-                            yield data[slice_start:slice_end]
-                    except zlib.error:
-                        logging.error(f"Failed to decompress chunk {chunk_hash} for asset {asset_id}")
-                        continue
+                            if slice_start < slice_end:
+                                yield data[slice_start:slice_end]
+                        except zlib.error:
+                            logging.error(f"Failed to decompress chunk {chunk_hash} for asset {asset_id}")
+                            continue
 
-            current_pos += chunk_size
-            if current_pos > end_byte:
-                break
+                current_pos += chunk_size
+                if current_pos > end_byte:
+                    break
+        finally:
+            conn.close()
 
     def stream_asset_data(self, asset_id: int) -> Iterator[bytes]:
         """Yields asset data chunk by chunk for streaming."""
+        # get_manifest is already refactored and uses a read connection
         manifest = self.get_manifest(asset_id)
         if not manifest:
             return
 
-        for block in manifest['chain']:
-            chunk_hash = block['chunk_hash']
-            with self.lock:
-                chunk_row = self.conn.execute("SELECT data FROM chunks WHERE hash=?", (chunk_hash,)).fetchone()
+        conn = self._get_read_conn()
+        try:
+            for block in manifest['chain']:
+                chunk_hash = block['chunk_hash']
+                chunk_row = conn.execute("SELECT data FROM chunks WHERE hash=?", (chunk_hash,)).fetchone()
 
-            if chunk_row and chunk_row['data']:
-                try:
-                    yield zlib.decompress(chunk_row['data'])
-                except zlib.error:
-                    logging.error(f"Failed to decompress chunk {chunk_hash} for asset {asset_id}")
-                    continue
+                if chunk_row and chunk_row['data']:
+                    try:
+                        yield zlib.decompress(chunk_row['data'])
+                    except zlib.error:
+                        logging.error(f"Failed to decompress chunk {chunk_hash} for asset {asset_id}")
+                        continue
+        finally:
+            conn.close()
 
     def get_asset_ids_with_paths_for_collection(self, collection_id: int, base_path: str = "") -> List[Tuple[int, str]]:
         """Recursively gets asset IDs and their zip paths for a collection."""
-        with self.lock:
-            results: List[Tuple[int, str]] = []
-            coll = self.get_collection(collection_id)
-            if not coll: return []
+        results: List[Tuple[int, str]] = []
+        # These sub-calls now use their own read connections and don't lock.
+        coll = self.get_collection(collection_id)
+        if not coll: return []
 
-            current_path = base_path + coll['name'] + '/'
+        current_path = base_path + coll['name'] + '/'
 
-            assets = self.get_assets_for_collection(collection_id, 0, 999999)['assets']
-            for a in assets:
-                if a.get('filename'):
-                    results.append((a['id'], current_path + a['filename']))
+        assets = self.get_assets_for_collection(collection_id, 0, 999999)['assets']
+        for a in assets:
+            if a.get('filename'):
+                results.append((a['id'], current_path + a['filename']))
 
-            subs = self.conn.execute("SELECT id FROM collections WHERE parent_id=?", (collection_id,)).fetchall()
-            for sub in subs:
-                results.extend(self.get_asset_ids_with_paths_for_collection(sub['id'], current_path))
-            return results
+        with self._get_read_conn() as conn:
+            subs = conn.execute("SELECT id FROM collections WHERE parent_id=?", (collection_id,)).fetchall()
+        
+        for sub in subs:
+            results.extend(self.get_asset_ids_with_paths_for_collection(sub['id'], current_path))
+        return results
 
     def get_asset_ids_with_paths_for_project(self, project_id: int) -> List[Tuple[int, str]]:
         """Gets all asset IDs and their zip paths for a project."""
-        with self.lock:
-            results: List[Tuple[int, str]] = []
-            proj = self.get_project(project_id)
-            if not proj: return []
-            base_path = proj['name'] + '/'
-            tops = self.conn.execute("SELECT id FROM collections WHERE project_id=? AND parent_id IS NULL", (project_id,)).fetchall()
-            for top in tops:
-                results.extend(self.get_asset_ids_with_paths_for_collection(top['id'], base_path))
-            return results
+        results: List[Tuple[int, str]] = []
+        proj = self.get_project(project_id) # Already refactored
+        if not proj: return []
+        base_path = proj['name'] + '/'
+        
+        with self._get_read_conn() as conn:
+            tops = conn.execute("SELECT id FROM collections WHERE project_id=? AND parent_id IS NULL", (project_id,)).fetchall()
+
+        for top in tops:
+            results.extend(self.get_asset_ids_with_paths_for_collection(top['id'], base_path))
+        return results
 
     def write_asset_to_zip(self, asset_id: int, zf: zipfile.ZipFile, path_in_zip: str) -> None:
         """Streams an asset's data directly into a ZipFile object."""
@@ -1840,13 +1966,14 @@ class CompactVaultManager:
                 raise
 
     def get_all_projects(self) -> List[Dict[str, Any]]:
-        with self.lock:
-            try:
-                cur = self.conn.execute("SELECT * FROM projects ORDER BY order_index ASC, name")
+        # No lock needed for reads with WAL mode
+        try:
+            with self._get_read_conn() as conn:
+                cur = conn.execute("SELECT * FROM projects ORDER BY order_index ASC, name")
                 return [dict(row) for row in cur.fetchall()]
-            except sqlite3.Error as e:
-                logging.error(f"Get all projects error: {e}")
-                return []
+        except sqlite3.Error as e:
+            logging.error(f"Get all projects error: {e}")
+            return []
 
     def create_collection(self, project_id: int, name: str, type: str, parent_id: Optional[int]) -> int:
         with self.lock:
@@ -1860,38 +1987,38 @@ class CompactVaultManager:
                 raise
 
     def get_collections_for_project(self, project_id: int) -> List[Dict[str, Any]]:
-        with self.lock:
-            try:
-                cur = self.conn.execute("SELECT * FROM collections WHERE project_id = ? ORDER BY order_index ASC, name", (project_id,))
+        try:
+            with self._get_read_conn() as conn:
+                cur = conn.execute("SELECT * FROM collections WHERE project_id = ? ORDER BY order_index ASC, name", (project_id,))
                 return [dict(row) for row in cur.fetchall()]
-            except sqlite3.Error as e:
-                logging.error(f"Get collections for project error: {e}")
-                return []
+        except sqlite3.Error as e:
+            logging.error(f"Get collections for project error: {e}")
+            return []
 
     def get_project(self, project_id: int) -> Optional[Dict[str, Any]]:
-        with self.lock:
-            try:
-                cur = self.conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
+        try:
+            with self._get_read_conn() as conn:
+                cur = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
                 row = cur.fetchone()
                 return dict(row) if row else None
-            except sqlite3.Error as e:
-                logging.error(f"Get project error: {e}")
-                return None
+        except sqlite3.Error as e:
+            logging.error(f"Get project error: {e}")
+            return None
 
     def get_collection(self, collection_id: int) -> Optional[Dict[str, Any]]:
-        with self.lock:
-            try:
-                cur = self.conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,))
+        try:
+            with self._get_read_conn() as conn:
+                cur = conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,))
                 row = cur.fetchone()
                 return dict(row) if row else None
-            except sqlite3.Error as e:
-                logging.error(f"Get collection error: {e}")
-                return None
+        except sqlite3.Error as e:
+            logging.error(f"Get collection error: {e}")
+            return None
 
     def get_asset_preview(self, asset_id: int) -> Optional[Dict[str, Any]]:
-        with self.lock:
-            try:
-                row = self.conn.execute('SELECT a.id, a.type, a.format, a.manifest, (SELECT value FROM metadata m WHERE m.asset_id=a.id AND m.key="filename" LIMIT 1) as filename FROM assets a WHERE a.id = ?', (asset_id,)).fetchone()
+        try:
+            with self._get_read_conn() as conn:
+                row = conn.execute('SELECT a.id, a.type, a.format, a.manifest, (SELECT value FROM metadata m WHERE m.asset_id=a.id AND m.key="filename" LIMIT 1) as filename FROM assets a WHERE a.id = ?', (asset_id,)).fetchone()
                 if not row: return None
                 manifest = json.loads(row['manifest'])
                 filename = manifest.get('filename', f'asset_{asset_id}')
@@ -1910,7 +2037,7 @@ class CompactVaultManager:
                             break
                             
                         chunk_hash = block['chunk_hash']
-                        chunk_row = self.conn.execute("SELECT data FROM chunks WHERE hash=?", (chunk_hash,)).fetchone()
+                        chunk_row = conn.execute("SELECT data FROM chunks WHERE hash=?", (chunk_hash,)).fetchone()
                         if chunk_row: 
                             decompressed = zlib.decompress(chunk_row['data'])
                             data.extend(decompressed)
@@ -1942,12 +2069,12 @@ class CompactVaultManager:
                 
                 else:
                     return {'id':asset_id, 'type':row['type'], 'format':row['format'], 'filename':filename, 'size_original':size}
-            except sqlite3.Error as e:
-                logging.error(f"Preview error: {e}")
-                return None
-            except Exception as e:
-                logging.error(f"Unexpected preview error: {e}")
-                return None
+        except sqlite3.Error as e:
+            logging.error(f"Preview error: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Unexpected preview error: {e}")
+            return None
 
     def vacuum(self) -> None:
         """Optimizes the database file."""
@@ -2472,10 +2599,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             chunk_files = sorted(os.listdir(upload_dir), key=int)
             chunk_paths = [os.path.join(upload_dir, cf) for cf in chunk_files]
 
-            final_collection_id = self.server.app_state["manager"].get_or_create_collection_from_path(collection_id, path_prefix)
-
-            # Add task to the queue
-            task = (final_collection_id, chunk_paths, filename)
+            # The worker will resolve the path to ensure atomicity
+            # Add task to the queue with the unresolved path
+            task = (collection_id, path_prefix, chunk_paths, filename)
             self.server.app_state["manager"].asset_creation_queue.put(task)
 
             self._send_json({'message': 'Upload accepted, processing in background'})
@@ -2535,53 +2661,67 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(500)
 
 def run(server_class: type = ThreadedHTTPServer, handler_class: type = RequestHandler, port: int = 8000) -> None:
-    # Server state
-    db_path: Optional[str] = None
-    manager: Optional[CompactVaultManager] = None
-    rendered_html: Optional[bytes] = None
-
-    server_class.app_state = {
-        "db_path": db_path,
-        "manager": manager,
-        "rendered_html": rendered_html,
-        "password": None  # No global password
-    }
-
-    # Find a free port
+    # Find a free port first
+    server_address = ('', port)
     while True:
         try:
-            server_address = ('', port)
             server = server_class(server_address, handler_class)
             break
         except OSError as e:
             if e.errno == 98:  # Address already in use
                 port += 1
+                server_address = ('', port)
             else:
                 raise
 
-    # Graceful shutdown
+    # Setup server state
+    server.app_state = {
+        "db_path": None,
+        "manager": None,
+        "rendered_html": None,
+        "password": None
+    }
+
+    # Graceful shutdown handler
     def signal_handler(sig: int, frame: Any) -> None:
-        logging.info('Shutting down server...')
-        try:
-            if server.app_state.get("manager"):
-                manager = server.app_state["manager"]
-                logging.info("Running database checkpoint...")
-                manager.conn.execute("PRAGMA wal_checkpoint(FULL);")
+        logging.info('Shutdown signal received. Starting graceful shutdown...')
+
+        manager = server.app_state.get("manager")
+        if manager:
+            # 1. Signal all worker threads to stop by sending a sentinel value.
+            logging.info(f"Signaling {len(manager.workers)} worker threads to terminate...")
+            for _ in manager.workers:
+                manager.asset_creation_queue.put(None)
+
+            # 2. Wait for all worker threads to complete their current tasks.
+            for t in manager.workers:
+                t.join()
+            logging.info("All worker threads have completed.")
+
+            # 3. Now that no threads are using the connection, safely checkpoint and close.
+            try:
+                logging.info("Running final database checkpoint...")
+                # TRUNCATE is more aggressive than FULL and ideal for shutdown.
+                manager.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 manager.conn.close()
                 logging.info("Database connection closed.")
-        except Exception as e:
-            logging.error(f"Error during DB shutdown: {e}")
-        finally:
-            logging.info("Stopping HTTP server.")
-            server.server_close()
-            sys.exit(0)
+            except Exception as e:
+                logging.error(f"Error during final DB cleanup: {e}")
+        
+        # 4. Finally, stop the server loop.
+        # This must be called from a separate thread to unblock `serve_forever`.
+        logging.info("Stopping HTTP server...")
+        threading.Thread(target=server.shutdown).start()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     logging.info(f'Starting httpd on port {port}...')
     webbrowser.open_new_tab(f'http://localhost:{port}')
+    
+    # Main server loop blocks here until server.shutdown() is called.
     server.serve_forever()
+    logging.info("Server has been shut down gracefully.")
 
 if __name__ == '__main__':
     run()
